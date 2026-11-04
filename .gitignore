@@ -3,3 +3,4 @@ renders/
 *.wav
 !tests/data/*.wav
 .DS_Store
+build-plugin/

@@ -29,3 +29,19 @@ cmake --build build --config Release
 | `tools/` | 命令行工具 |
 
 引擎只用 C++17 标准库，后面直接放进 JUCE 插件。
+
+## 插件（JUCE）
+
+```
+cmake -S . -B build -DLBTRA_BUILD_PLUGIN=ON          # 自动下载 JUCE 8.0.4
+cmake --build build --config Release --target LBTra_All
+```
+
+产物在 `build/LBTra_artefacts/Release/`（VST3、Mac 上还有 AU、独立运行版）。GitHub Actions 的 plugin 任务会编译 Mac（通用二进制）和 Windows 版并上传为下载包。
+
+- 5 个声音槽：拖入音频（可一次拖多个），自动识别，右键清空。
+- 上升 / 下降长度、风格、压缩量旋钮、最终混响、最终 EQ、输出音量。trance gate 暂时不做。
+- 摇骰子 = 新种子重新渲染；改参数或宿主速度变化会用同一个种子自动重渲染。
+- Play 模式：MIDI 音符触发，从上升开头播放（音符放在小节线前"上升长度"处）。
+- Loop 模式：宿主走带时每 N 小节自动触发，衔接点落在小节线上。
+- 工程保存时记住声音文件路径、种子和参数。
