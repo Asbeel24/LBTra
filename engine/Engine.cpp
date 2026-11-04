@@ -60,24 +60,24 @@ Role pickRole(const Analysis& a, Rng& r, bool arrangeOnly) {
 }
 
 std::vector<float> fxWeights(const Analysis& a, Style st, Role role) {
-    //               Reverb RevRev Delay  Eq   Dist Crystal Stutter Gran
-    std::vector<float> w{1.0f, 0.7f, 1.0f, 1.0f, 0.6f, 0.6f, 0.5f, 0.5f};
+    //               Reverb RevRev Delay  Eq   Dist Crystal Stutter Gran Shaper GrainDly Chroma
+    std::vector<float> w{0.9f, 0.6f, 1.0f, 0.8f, 0.6f, 1.0f, 0.5f, 0.6f, 1.4f, 1.1f, 0.9f};
     auto mul = [&](FxType t, float m) { w[(size_t)t] *= m; };
     switch (st) {
-    case Style::Dirty: mul(FxType::Distortion, 3.f); mul(FxType::Stutter, 1.5f); mul(FxType::Reverb, 0.5f); mul(FxType::ReverseReverb, 0.5f); break;
-    case Style::Ambient: mul(FxType::Reverb, 2.f); mul(FxType::ReverseReverb, 2.f); mul(FxType::Delay, 1.5f); mul(FxType::Granular, 1.2f); mul(FxType::Distortion, 0.2f); mul(FxType::Stutter, 0.3f); break;
-    case Style::Fragment: mul(FxType::Granular, 3.f); mul(FxType::Stutter, 2.5f); mul(FxType::Crystal, 2.f); mul(FxType::Reverb, 0.6f); break;
+    case Style::Dirty: mul(FxType::Distortion, 3.f); mul(FxType::Stutter, 1.5f); mul(FxType::Shaper, 1.5f); mul(FxType::Reverb, 0.5f); mul(FxType::ReverseReverb, 0.5f); break;
+    case Style::Ambient: mul(FxType::Reverb, 2.f); mul(FxType::ReverseReverb, 2.f); mul(FxType::Delay, 1.5f); mul(FxType::GrainDelay, 1.5f); mul(FxType::Chroma, 1.5f); mul(FxType::Crystal, 1.5f); mul(FxType::Granular, 1.2f); mul(FxType::Distortion, 0.2f); mul(FxType::Stutter, 0.3f); break;
+    case Style::Fragment: mul(FxType::Shaper, 2.f); mul(FxType::Granular, 3.f); mul(FxType::Stutter, 2.5f); mul(FxType::Crystal, 2.f); mul(FxType::Reverb, 0.6f); break;
     case Style::Neutral: break;
     }
     switch (a.kind) {
-    case Kind::Tonal: mul(FxType::Crystal, 1.5f); mul(FxType::ReverseReverb, 1.5f); break;
-    case Kind::FX: mul(FxType::Eq, 1.5f); mul(FxType::Granular, 1.3f); mul(FxType::Crystal, 0.6f); break;
+    case Kind::Tonal: mul(FxType::Crystal, 1.5f); mul(FxType::GrainDelay, 1.3f); mul(FxType::ReverseReverb, 1.5f); break;
+    case Kind::FX: mul(FxType::Eq, 1.2f); mul(FxType::Granular, 1.3f); mul(FxType::Chroma, 1.6f); break;
     case Kind::Percussive: mul(FxType::Stutter, 2.f); mul(FxType::Reverb, 0.7f); break;
     case Kind::Loop: mul(FxType::Stutter, 2.f); mul(FxType::Granular, 1.5f); break;
     }
     if (a.reg == Register::Low) {
         mul(FxType::Reverb, 0.4f); mul(FxType::ReverseReverb, 0.4f); mul(FxType::Delay, 0.5f);
-        mul(FxType::Granular, 0.3f); mul(FxType::Crystal, 0.3f); mul(FxType::Distortion, 1.5f);
+        mul(FxType::Granular, 0.3f); mul(FxType::Crystal, 0.3f); mul(FxType::GrainDelay, 0.3f); mul(FxType::Chroma, 0.2f); mul(FxType::Distortion, 1.5f);
     }
     if (role == Role::BuildReverse) mul(FxType::ReverseReverb, 0.3f); // already reversed
     if (role == Role::Roll) w[(size_t)FxType::Stutter] = 0.f;           // forced separately
@@ -198,6 +198,7 @@ struct Track {
     Role role = Role::Fill;
     float transpose = 0, gainDb = 0, pan = 0, fitRatio = 1, extraHp = 0;
     bool fit = false;
+    bool stretch = false; // fit by granular stretch (pitch kept) instead of varispeed
     bool coverage = false; // changed so the rise is not empty
     bool reverse = false;
     float patternStep = 0.5f; // beats between repeats (Pattern role)
@@ -213,6 +214,28 @@ struct Track {
     EnvelopeChoice env;
     Region region;
 };
+
+// Granular time stretch (pitch kept): 80 ms Hann grains at 75% overlap, read position advances
+// 1/factor as fast, small random jitter so it does not sound like a buzz.
+Buffer stretchOla(const Buffer& in, float factor, uint64_t seed) {
+    const int g = in.sr * 8 / 100, hop = g / 4;
+    const int n = (int)((float)in.size() * factor);
+    Buffer out(n + g, in.sr);
+    Rng r(seed);
+    std::vector<float> norm((size_t)(n + g), 0.f);
+    for (int o = 0; o < n; o += hop) {
+        const double src = std::clamp((double)o / factor + r.range(-0.01f, 0.01f) * in.sr, 0.0, (double)std::max(0, in.size() - g));
+        for (int i = 0; i < g; ++i) {
+            const float w = 0.5f - 0.5f * std::cos(2.f * kPi * (float)i / (float)(g - 1));
+            out.L[(size_t)(o + i)] += readCubic(in.L, src + i) * w;
+            out.R[(size_t)(o + i)] += readCubic(in.R, src + i) * w;
+            norm[(size_t)(o + i)] += w;
+        }
+    }
+    for (int i = 0; i < n; ++i) { const float k = norm[(size_t)i] > 0.3f ? 1.f / norm[(size_t)i] : 1.f; out.L[(size_t)i] *= k; out.R[(size_t)i] *= k; }
+    out.resize(n);
+    return out;
+}
 
 std::string fmtf(const char* f, double v) {
     char buf[64];
@@ -300,13 +323,9 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (earliest > tl.downbeat * 2 / 5 && best >= 0 && bestAnchor > 0) {
             Track& t = tracks[(size_t)best];
             const float ratio = (float)bestAnchor / (float)std::max(1, junctionBuild);
-            if (ratio >= 0.3f) { t.fit = true; t.coverage = true; }
-            else {
-                t.role = Role::Pattern;
-                t.coverage = true;
-                t.patternStep = req.lengthBeats >= 4.f ? 1.f : 0.5f;
-                t.patternCount = std::max(1, (int)std::floor(req.lengthBeats / t.patternStep + 1e-3f));
-            }
+            t.fit = true; t.coverage = true;
+            // slowing down by more than ~1.6x muddies the sound: stretch with grains instead (pitch kept)
+            t.stretch = ratio < 0.6f && !(ratio >= 0.4f && rng.chance(0.4f));
         }
     }
 
@@ -321,7 +340,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (t.role == Role::Downlift) cutBeforeLoudest(src);
         if (t.fit && src.size() > 0) {
             const float ratio = (float)loudestPos(src) / (float)std::max(1, junctionBuild);
-            if (ratio > (t.coverage ? 0.29f : 0.5f) && ratio < 4.f) { t.fitRatio = ratio; src = varispeed(src, ratio); }
+            if (ratio > (t.coverage ? 0.05f : 0.5f) && ratio < 4.f) { t.fitRatio = ratio; src = t.stretch ? stretchOla(src, 1.f / ratio, 7) : varispeed(src, ratio); }
             else t.fit = false;
         }
         int start = 0;
@@ -368,7 +387,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         src = varispeed(src, semisToRatio(t.transpose));
         if (t.reverse) reverseInPlace(src);
         if (t.role == Role::Downlift) cutBeforeLoudest(src);
-        if (t.fit) src = varispeed(src, t.fitRatio);
+        if (t.fit) src = t.stretch ? stretchOla(src, 1.f / t.fitRatio, 7) : varispeed(src, t.fitRatio);
         // gain staging: loudest 100 ms at -16 dBFS, then the dice gain
         const float lr = loudestRms(src);
         const float g = lr > 1e-6f ? dbToGain(-16.f + t.gainDb) / lr : 1.f;
@@ -412,6 +431,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         lim.maxReverbSec = lim.lowRegister ? 1.5f : 6.f;
         lim.maxDriveDb = lim.lowRegister ? 14.f : 24.f;
         lim.allowPitch = !lim.lowRegister;
+        if (a.kind == Kind::Tonal && a.f0 > 0) lim.rootHz = a.f0;
         std::vector<FxType> chosen;
         if (t.role == Role::Roll) chosen.push_back(FxType::Stutter);
         const int count = req.arrangeOnly ? 0 : std::min(kMaxFxPerTrack, (int)chosen.size() + 1 + rng.weighted({0.3f, 0.4f, 0.3f}));
@@ -533,10 +553,10 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (a.f0 > 0) trackReport += "，" + a.noteName();
         trackReport += "）\n  - 角色：" + std::string(roleName(t.role));
         if (t.reverse && t.role != Role::BuildReverse) trackReport += "，倒放";
-        if (t.coverage) trackReport += "（素材比上升段短太多，" + std::string(t.role == Role::Pattern ? "改成按拍重复铺满上升段" : "放慢铺满上升段") + "）";
+        if (t.coverage) trackReport += "（素材比上升段短太多，" + std::string(t.stretch ? "用粒子拉伸铺满上升段，音高不变" : "放慢铺满上升段") + "）";
         if (t.role == Role::Pattern) trackReport += "（每 " + beatsLabel(t.patternStep * 1.f) + " 一下，共 " + std::to_string(t.patternCount) + " 下）";
         if (t.transpose != 0) trackReport += "，变调 " + fmtf("%+.0f", t.transpose) + " 半音";
-        if (t.fit) trackReport += "，拉伸到过渡长度（" + fmtf("%.2f", t.fitRatio) + " 倍速）";
+        if (t.fit) trackReport += t.stretch ? "，粒子拉伸 " + fmtf("%.1f", 1.f / t.fitRatio) + " 倍长" : "，拉伸到过渡长度（" + fmtf("%.2f", t.fitRatio) + " 倍速）";
         trackReport += "，音量 " + fmtf("%.1f", t.gainDb) + " dB";
         if (t.pan != 0) trackReport += "，声像 " + fmtf("%+.2f", t.pan);
         if (t.extraHp > 0) trackReport += "，避让低频高通 150Hz";

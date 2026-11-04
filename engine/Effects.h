@@ -28,7 +28,7 @@ public:
     virtual std::string describe() const = 0; // Chinese, with parameters
 };
 
-enum class FxType { Reverb, ReverseReverb, Delay, Eq, Distortion, Crystal, Stutter, Granular, Count };
+enum class FxType { Reverb, ReverseReverb, Delay, Eq, Distortion, Crystal, Stutter, Granular, Shaper, GrainDelay, Chroma, Count };
 const char* fxName(FxType t);
 
 // Parameter ranges come from the dice; `rng` is consumed only inside make().
@@ -37,6 +37,7 @@ struct FxLimits {
     float maxDriveDb = 24.f;
     bool lowRegister = false;
     bool allowPitch = true;
+    float rootHz = 0.f; // detected note of the source (tonal), 0 = unknown
 };
 std::unique_ptr<Effect> makeEffect(FxType t, Rng& rng, const FxLimits& lim, const Timeline& tl, const Region& r);
 

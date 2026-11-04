@@ -22,6 +22,7 @@ std::string beatsName(float b) {
     if (std::fabs(b - 0.125f) < 1e-3f) return "1/32";
     if (std::fabs(b - 0.25f) < 1e-3f) return "1/16";
     if (std::fabs(b - 1.f / 3.f) < 1e-3f) return "1/8T";
+    if (std::fabs(b - 1.f / 6.f) < 1e-3f) return "1/16T";
     if (std::fabs(b - 0.5f) < 1e-3f) return "1/8";
     if (std::fabs(b - 0.75f) < 1e-3f) return "3/16";
     if (std::fabs(b - 1.f) < 1e-3f) return "1/4";
@@ -117,54 +118,168 @@ public:
     std::string describe() const override { return fmt("倒放混响（衰减 %.1fs，量 %d%%）", decay, (int)(level * 100)); }
 };
 
-// ------------------------------------------------------------------ Delay / grain delay
+// ------------------------------------------------------------------ Character delay
+// Tape (wow/flutter, saturating, darker each repeat), Dub (resonant band in the loop, can build up),
+// Digital (clean ping-pong) and Diffuse (allpass smear in the loop). L/R can run different times.
+// The wet signal ducks under the dry sound so the echoes bloom in the gaps.
 class Delay : public Effect {
 public:
-    float beats, fb, mix, lpHz, hpHz, semis;
+    enum Mode { Tape, Dub, Digital, Diffuse } mode;
+    float beatsL, beatsR, fb, mix, lpHz, hpHz, wowDepthMs, wowHz, drive, duck;
     bool pingpong;
-    int grainMs;
     Delay(Rng& r, const FxLimits& lim) {
-        beats = r.pick<float>({0.125f, 0.25f, 0.5f, 0.75f, 1.f / 3.f});
-        fb = r.range(0.f, 0.7f);
-        mix = r.range(0.2f, 0.6f);
-        lpHz = r.logRange(2000.f, 12000.f);
-        hpHz = r.logRange(100.f, 600.f);
-        pingpong = r.chance(0.5f);
-        semis = (lim.allowPitch && r.chance(0.45f)) ? r.pick<float>({12.f, -12.f, 7.f, 5.f, -5.f}) : 0.f;
-        grainMs = r.irange(40, 120);
+        mode = (Mode)r.weighted({1.2f, 1.f, 0.7f, 0.8f});
+        beatsL = r.pick<float>({0.25f, 0.5f, 0.75f, 1.f / 3.f, 1.f, 0.125f});
+        beatsR = r.chance(0.4f) ? r.pick<float>({0.25f, 0.5f, 0.75f, 1.f / 3.f, 0.375f}) : beatsL;
+        fb = mode == Dub ? r.range(0.6f, 0.92f) : r.range(0.3f, 0.8f);
+        mix = r.range(0.3f, 0.7f);
+        lpHz = mode == Tape ? r.logRange(1800.f, 6000.f) : r.logRange(3000.f, 12000.f);
+        hpHz = lim.lowRegister ? r.logRange(200.f, 500.f) : r.logRange(100.f, 700.f);
+        wowDepthMs = mode == Tape ? r.range(0.6f, 3.5f) : mode == Diffuse ? r.range(0.2f, 1.f) : 0.f;
+        wowHz = r.range(0.3f, 1.6f);
+        drive = mode == Tape || mode == Dub ? r.range(1.f, 3.f) : 1.f;
+        duck = r.range(0.f, 0.8f);
+        pingpong = mode == Digital || r.chance(0.35f);
     }
     void process(Buffer& b, const Timeline& t, const Region&) override {
-        const int d = std::max(1, t.beats(beats));
-        std::vector<float> rl((size_t)d, 0.f), rr((size_t)d, 0.f);
-        Biquad lpl, lpr, hpl, hpr;
-        lpl.set(Biquad::LP, lpHz, 0.707f, 0, (float)b.sr); lpr = lpl;
-        hpl.set(Biquad::HP, hpHz, 0.707f, 0, (float)b.sr); hpr = hpl;
-        PitchShifter psl, psr;
-        const bool ps = std::fabs(semis) > 0.01f;
-        if (ps) { psl.init(grainMs * b.sr / 1000, semisToRatio(semis)); psr.init(grainMs * b.sr / 1000, semisToRatio(semis)); }
-        int idx = 0;
-        for (int i = 0; i < b.size(); ++i) {
-            const float dl = rl[(size_t)idx], dr = rr[(size_t)idx];
-            float fl = hpl.process(lpl.process(dl)), fr = hpr.process(lpr.process(dr));
-            if (ps) { fl = psl.process(fl); fr = psr.process(fr); }
-            const float inL = b.L[(size_t)i], inR = b.R[(size_t)i];
-            if (pingpong) {
-                rl[(size_t)idx] = 0.5f * (inL + inR) + fb * fr;
-                rr[(size_t)idx] = fb * fl;
-            } else {
-                rl[(size_t)idx] = inL + fb * fl;
-                rr[(size_t)idx] = inR + fb * fr;
+        const int n = b.size();
+        const float sr = (float)b.sr;
+        const int dL = std::max(1, t.beats(beatsL)), dR = std::max(1, t.beats(beatsR));
+        const int cap = std::max(dL, dR) + b.sr / 10 + 8;
+        std::vector<float> ll((size_t)cap, 0.f), lr((size_t)cap, 0.f);
+        Biquad lpl, lpr, hpl, hpr, bpl, bpr;
+        lpl.set(Biquad::LP, lpHz, 0.707f, 0, sr); lpr = lpl;
+        hpl.set(Biquad::HP, hpHz, 0.707f, 0, sr); hpr = hpl;
+        // Dub: a resonant band that sweeps slowly inside the loop
+        float bpPh = 0.f;
+        struct Ap { std::vector<float> z; int i = 0; float g = 0.6f; float run(float x) { float y = z[(size_t)i]; float v = x + g * y; z[(size_t)i] = v; if (++i >= (int)z.size()) i = 0; return y - g * v; } };
+        Ap apl[3], apr[3];
+        const int apT[3] = {142, 379, 773};
+        for (int k = 0; k < 3; ++k) { apl[k].z.assign((size_t)(apT[k] * b.sr / 44100 + 1), 0.f); apr[k].z.assign((size_t)((apT[k] + 37) * b.sr / 44100 + 1), 0.f); }
+        auto readLine = [&](const std::vector<float>& x, int w, float d) {
+            float pos = (float)w - d;
+            while (pos < 0) pos += (float)cap;
+            const int i0 = (int)pos % cap, i1 = (i0 + 1) % cap;
+            const float fr = pos - std::floor(pos);
+            return x[(size_t)i0] * (1 - fr) + x[(size_t)i1] * fr;
+        };
+        float env = 0;
+        const float att = std::exp(-1.f / (0.004f * sr)), rel = std::exp(-1.f / (0.12f * sr));
+        int w = 0;
+        for (int i = 0; i < n; ++i) {
+            const float wow = wowDepthMs * 0.001f * sr * (0.7f * std::sin(2.f * kPi * wowHz * (float)i / sr) + 0.3f * std::sin(2.f * kPi * 7.3f * (float)i / sr));
+            float yl = readLine(ll, w, (float)dL + wow), yr = readLine(lr, w, (float)dR + wow * 0.9f);
+            yl = hpl.process(lpl.process(yl)); yr = hpr.process(lpr.process(yr));
+            if (mode == Dub) {
+                if ((i & 63) == 0) {
+                    bpPh += 64.f / sr * 0.15f;
+                    const float f = 400.f * std::pow(8.f, 0.5f - 0.5f * std::cos(2.f * kPi * bpPh));
+                    const float z1 = bpl.z1, z2 = bpl.z2, z3 = bpr.z1, z4 = bpr.z2;
+                    bpl.set(Biquad::Peak, f, 2.5f, 8.f, sr); bpr = bpl;
+                    bpl.z1 = z1; bpl.z2 = z2; bpr.z1 = z3; bpr.z2 = z4;
+                }
+                yl = bpl.process(yl); yr = bpr.process(yr);
             }
-            b.L[(size_t)i] = inL + mix * fl;
-            b.R[(size_t)i] = inR + mix * fr;
-            if (++idx >= d) idx = 0;
+            if (mode == Diffuse) for (int k = 0; k < 3; ++k) { yl = apl[k].run(yl); yr = apr[k].run(yr); }
+            if (drive > 1.01f) { yl = std::tanh(yl * drive) / drive * 1.2f; yr = std::tanh(yr * drive) / drive * 1.2f; }
+            const float inL = b.L[(size_t)i], inR = b.R[(size_t)i];
+            if (pingpong) { ll[(size_t)w] = 0.5f * (inL + inR) + fb * yr; lr[(size_t)w] = fb * yl; }
+            else { ll[(size_t)w] = inL + fb * yl; lr[(size_t)w] = inR + fb * yr; }
+            const float x = std::max(std::fabs(inL), std::fabs(inR));
+            env = x > env ? att * env + (1 - att) * x : rel * env + (1 - rel) * x;
+            const float dg = 1.f / (1.f + duck * 8.f * env);
+            b.L[(size_t)i] = inL + mix * yl * dg;
+            b.R[(size_t)i] = inR + mix * yr * dg;
+            if (++w >= cap) w = 0;
         }
     }
     std::string describe() const override {
-        std::string s = fmt("%s（%s，反馈 %d%%，湿 %d%%%s", std::fabs(semis) > 0.01f ? "粒子延迟" : "延迟", beatsName(beats).c_str(),
-                            (int)(fb * 100), (int)(mix * 100), pingpong ? "，乒乓" : "");
-        if (std::fabs(semis) > 0.01f) s += fmt("，每次回声变调 %+d 半音，颗粒 %dms", (int)semis, grainMs);
+        static const char* modeN[] = {"磁带延迟", "Dub 延迟", "数字乒乓延迟", "扩散延迟"};
+        std::string time = beatsL == beatsR ? beatsName(beatsL) : "左 " + beatsName(beatsL) + " / 右 " + beatsName(beatsR);
+        std::string s = fmt("%s（%s，反馈 %d%%，湿 %d%%，低通 %.0fHz", modeN[mode], time.c_str(), (int)(fb * 100), (int)(mix * 100), lpHz);
+        if (wowDepthMs > 0) s += fmt("，抖动 %.1fms", wowDepthMs);
+        if (drive > 1.01f) s += fmt("，回声饱和 x%.1f", drive);
+        if (mode == Dub) s += "，回路里有共振扫频";
+        if (duck > 0.2f) s += fmt("，湿声闪避 %d%%", (int)(duck * 100));
+        if (pingpong && mode != Digital) s += "，乒乓";
         return s + "）";
+    }
+};
+
+// ------------------------------------------------------------------ Grain delay
+// Grains are read out of a feedback delay line: each one has its own pitch (from a chord / octave
+// set), length, direction and pan. With feedback the pitched grains climb or fall in a spiral.
+class GrainDelay : public Effect {
+public:
+    float beats, fb, mix, density, jitterBeats, reverseProb, grainMs;
+    std::vector<float> pitches;
+    bool synced;
+    uint64_t seed;
+    GrainDelay(Rng& r, const FxLimits& lim) {
+        beats = r.pick<float>({0.25f, 0.5f, 0.75f, 1.f, 1.f / 3.f});
+        fb = r.range(0.2f, 0.75f);
+        mix = r.range(0.35f, 0.8f);
+        density = r.range(12.f, 45.f);
+        jitterBeats = r.range(0.f, 0.25f);
+        reverseProb = r.range(0.f, 0.5f);
+        grainMs = r.range(35.f, 180.f);
+        synced = r.chance(0.4f);
+        if (lim.allowPitch) pitches = r.pick<std::vector<float>>({{12.f}, {12.f, 0.f}, {7.f, 12.f}, {-12.f, 0.f}, {12.f, 19.f, 24.f}, {0.f, 5.f, 12.f}, {-5.f, 7.f}, {0.f, 0.1f, -0.1f}});
+        else pitches = {0.f, 0.f, 12.f};
+        seed = r.next();
+    }
+    void process(Buffer& b, const Timeline& t, const Region&) override {
+        const int n = b.size();
+        const float sr = (float)b.sr;
+        Rng r(seed);
+        const int d = std::max(1, t.beats(beats));
+        std::vector<float> lineL((size_t)n, 0.f), lineR((size_t)n, 0.f), outL((size_t)n, 0.f), outR((size_t)n, 0.f);
+        struct Grain { double pos; float ratio; int len, age; bool rev; float gl, gr; };
+        std::vector<Grain> active;
+        const int synStep = std::max(64, t.beats(0.25f));
+        double nextSpawn = d;
+        Biquad lpl, lpr; lpl.set(Biquad::LP, 9000.f, 0.707f, 0, sr); lpr = lpl;
+        for (int i = 0; i < n; ++i) {
+            if ((double)i >= nextSpawn) {
+                Grain g;
+                g.ratio = semisToRatio(r.pick(pitches));
+                g.len = std::max(64, (int)(grainMs * 0.001f * sr * r.range(0.7f, 1.3f)));
+                g.rev = r.chance(reverseProb);
+                // read window [start, start + len*ratio] must already be written (< i)
+                const double span = (double)g.len * (double)g.ratio;
+                double start = (double)i - (double)d - r.uni() * (double)t.beats(jitterBeats);
+                start = std::min(start, (double)i - span - 2.0);
+                g.pos = std::max(0.0, start);
+                g.age = 0;
+                const float pan = r.range(-0.9f, 0.9f);
+                g.gl = std::sqrt(0.5f * (1 - pan)); g.gr = std::sqrt(0.5f * (1 + pan));
+                active.push_back(g);
+                nextSpawn += synced ? (double)synStep * (r.chance(0.3f) ? 0.5 : 1.0) : (double)sr / density * r.range(0.5f, 1.5f);
+            }
+            float sl = 0, sr2 = 0;
+            for (auto& g : active) {
+                const float w = hann(g.age, g.len);
+                const double p = g.rev ? g.pos + (double)(g.len - 1 - g.age) * g.ratio : g.pos + (double)g.age * g.ratio;
+                sl += readCubic(lineL, p) * w * g.gl;
+                sr2 += readCubic(lineR, p) * w * g.gr;
+                ++g.age;
+            }
+            active.erase(std::remove_if(active.begin(), active.end(), [](const Grain& g) { return g.age >= g.len; }), active.end());
+            sl = lpl.process(sl); sr2 = lpr.process(sr2);
+            outL[(size_t)i] = sl; outR[(size_t)i] = sr2;
+            lineL[(size_t)i] = b.L[(size_t)i] + fb * std::tanh(sl);
+            lineR[(size_t)i] = b.R[(size_t)i] + fb * std::tanh(sr2);
+        }
+        float dry = 0, wet = 0;
+        for (int i = 0; i < n; ++i) { dry += b.L[(size_t)i] * b.L[(size_t)i]; wet += outL[(size_t)i] * outL[(size_t)i]; }
+        const float k = wet > 1e-12f ? std::min(4.f, std::sqrt(dry / wet)) : 1.f;
+        for (int i = 0; i < n; ++i) { b.L[(size_t)i] += mix * k * outL[(size_t)i]; b.R[(size_t)i] += mix * k * outR[(size_t)i]; }
+    }
+    std::string describe() const override {
+        std::string p;
+        for (float v : pitches) p += (p.empty() ? "" : "/") + fmt("%+g", std::round(v * 10) / 10);
+        return fmt("颗粒延迟（%s，反馈 %d%%，湿 %d%%，%s，颗粒 %.0fms，音高 %s，倒放 %d%%，抖动 %.2f 拍）", beatsName(beats).c_str(), (int)(fb * 100),
+                   (int)(mix * 100), synced ? "颗粒按 1/16 拍子出" : fmt("%.0f 粒/秒", density).c_str(), grainMs, p.c_str(), (int)(reverseProb * 100), jitterBeats);
     }
 };
 
@@ -279,54 +394,150 @@ public:
     }
 };
 
-// ------------------------------------------------------------------ Crystal (reverse pitched slice echoes)
+// ------------------------------------------------------------------ Crystal (reverse pitched splice echo)
+// Splices of the delayed signal are played backwards and re-pitched; with feedback each pass goes
+// through the pitch again, so the echoes climb into a shimmering cascade. Two overlapping streams
+// (50% Hann) keep it smooth; splices alternate left/right.
 class Crystal : public Effect {
 public:
-    float chunkBeats, semis, decay, mix;
-    int repeats;
+    float spliceMs, delayMs, semis, fb, mix, width;
     bool reverse;
     Crystal(Rng& r, const FxLimits& lim) {
-        chunkBeats = r.pick<float>({0.125f, 0.25f, 0.5f});
-        semis = lim.allowPitch ? r.pick<float>({12.f, 7.f, -12.f, 19.f, 5.f, 0.f}) : 0.f;
-        repeats = r.irange(1, 4);
-        decay = r.range(0.4f, 0.8f);
-        mix = r.range(0.4f, 0.8f);
-        reverse = r.chance(0.7f);
+        spliceMs = r.logRange(40.f, 350.f);
+        delayMs = r.range(0.f, 400.f);
+        semis = lim.allowPitch ? r.pick<float>({12.f, 12.f, 7.f, -12.f, 5.f, 19.f, 0.f, -5.f}) : 0.f;
+        fb = r.range(0.35f, 0.85f);
+        mix = r.range(0.4f, 0.85f);
+        width = r.range(0.4f, 1.f);
+        reverse = r.chance(0.8f);
+    }
+    void process(Buffer& b, const Timeline&, const Region&) override {
+        const int n = b.size();
+        const float sr = (float)b.sr;
+        const int S = std::max(256, (int)(spliceMs * 0.001f * sr)) & ~1;
+        const float ratio = semisToRatio(semis);
+        const int D = std::max((int)(delayMs * 0.001f * sr), (int)std::ceil((float)S * ratio) + 2);
+        std::vector<float> lineL = b.L, lineR = b.R, outL((size_t)n, 0.f), outR((size_t)n, 0.f);
+        Biquad hl, hr; hl.set(Biquad::HP, 150.f, 0.707f, 0, sr); hr = hl;
+        int k = 0;
+        for (int T = 0; T < n; T += S / 2, ++k) {
+            const int src = T - D;
+            if (src < 0) continue;
+            const float pl = (k & 1) ? 1.f - 0.5f * width : 1.f, pr = (k & 1) ? 1.f : 1.f - 0.5f * width;
+            for (int i = 0; i < S && T + i < n; ++i) {
+                const int j = reverse ? S - 1 - i : i;
+                const double p = (double)src + (double)j * ratio;
+                const float w = hann(i, S);
+                const float yl = readCubic(lineL, p) * w, yr = readCubic(lineR, p) * w;
+                outL[(size_t)(T + i)] += yl * pl;
+                outR[(size_t)(T + i)] += yr * pr;
+                lineL[(size_t)(T + i)] += fb * yl;
+                lineR[(size_t)(T + i)] += fb * yr;
+            }
+        }
+        float dry = 0, wet = 0;
+        for (int i = 0; i < n; ++i) { outL[(size_t)i] = hl.process(outL[(size_t)i]); outR[(size_t)i] = hr.process(outR[(size_t)i]); dry += b.L[(size_t)i] * b.L[(size_t)i]; wet += outL[(size_t)i] * outL[(size_t)i]; }
+        const float kk = wet > 1e-12f ? std::min(3.f, std::sqrt(dry / wet)) : 1.f;
+        for (int i = 0; i < n; ++i) { b.L[(size_t)i] = b.L[(size_t)i] * (1.f - 0.4f * mix) + mix * kk * outL[(size_t)i]; b.R[(size_t)i] = b.R[(size_t)i] * (1.f - 0.4f * mix) + mix * kk * outR[(size_t)i]; }
+    }
+    std::string describe() const override {
+        return fmt("结晶（%s切片 %.0fms，延迟 %.0fms，每次回声 %+d 半音并反复叠加，反馈 %d%%，湿 %d%%，左右交替）", reverse ? "倒放" : "", spliceMs, delayMs,
+                   (int)semis, (int)(fb * 100), (int)(mix * 100));
+    }
+};
+
+// ------------------------------------------------------------------ Chroma (harmoniser / chord resonator)
+// Makes any sound (noise, FX) play a chord: either pitch-shifted voices stacked in the chord, or a
+// bank of tuned comb resonators excited by the sound. The chord can change on the junction.
+class Chroma : public Effect {
+public:
+    enum Mode { Harmonize, Resonate } mode;
+    float rootHz, fbk, mix;
+    std::vector<float> chordA, chordB;
+    bool change;
+    Chroma(Rng& r, const FxLimits& lim) {
+        mode = r.chance(0.55f) ? Resonate : Harmonize;
+        rootHz = lim.rootHz > 20.f ? lim.rootHz : 110.f * semisToRatio((float)r.irange(0, 7));
+        const std::vector<std::vector<float>> chords = {{0, 3, 7, 10}, {0, 3, 7, 14}, {0, 4, 7, 11}, {0, 5, 7, 12}, {0, 7, 12, 15}, {0, 3, 7, 12}};
+        chordA = r.pick(chords);
+        change = r.chance(0.5f);
+        // common hip-hop moves on the bar line: i -> VI, i -> iv, i -> bVII
+        const float shift = r.pick<float>({-4.f, 5.f, -2.f, 3.f});
+        chordB = chordA;
+        if (change) for (float& v : chordB) v += shift;
+        if (mode == Harmonize) for (auto* c : {&chordA, &chordB}) { auto& v = *c; v.erase(v.begin()); if (v.size() > 2) v.resize(2); }
+        fbk = r.range(0.93f, 0.985f);
+        mix = mode == Resonate ? r.range(0.35f, 0.8f) : r.range(0.3f, 0.6f);
     }
     void process(Buffer& b, const Timeline& t, const Region&) override {
-        const int chunk = std::max(64, t.beats(chunkBeats));
-        const float ratio = semisToRatio(semis);
-        Buffer out(b.size(), b.sr);
-        const int fade = std::min(chunk / 4, b.sr / 300);
-        for (int k = 0; k + chunk <= b.size(); k += chunk) {
-            if (stereoRms(b, k, k + chunk) < 1e-4f) continue;
-            Buffer seg(chunk, b.sr);
-            for (int i = 0; i < chunk; ++i) { seg.L[(size_t)i] = b.L[(size_t)(k + i)]; seg.R[(size_t)i] = b.R[(size_t)(k + i)]; }
-            if (reverse) reverseInPlace(seg);
-            seg = varispeed(seg, ratio);
-            const int n = seg.size();
+        const int n = b.size();
+        const float sr = (float)b.sr;
+        Buffer wet(n, b.sr);
+        const int xf = b.sr / 50;
+        auto blendB = [&](int i) { return std::clamp((float)(i - t.downbeat + xf) / (float)(2 * xf), 0.f, 1.f) * (change ? 1.f : 0.f); };
+        if (mode == Resonate) {
+            // one comb per chord note, moved into 180..900 Hz, with damping in the loop
+            const size_t voices = chordA.size();
+            auto fold = [](float f) { while (f < 180.f) f *= 2.f; while (f > 900.f) f *= 0.5f; return f; };
+            std::vector<std::vector<float>> zl(voices), zr(voices);
+            std::vector<float> lpL(voices, 0.f), lpR(voices, 0.f);
+            const int maxD = (int)(sr / 170.f) + 4;
+            for (size_t v = 0; v < voices; ++v) { zl[v].assign((size_t)maxD, 0.f); zr[v].assign((size_t)maxD, 0.f); }
+            Biquad pre[2]; pre[0].set(Biquad::HP, 250.f, 0.707f, 0, sr); pre[1] = pre[0];
+            int w = 0;
             for (int i = 0; i < n; ++i) {
-                float w = 1.f;
-                if (i < fade) w = (float)i / (float)fade;
-                if (i > n - fade) w = (float)(n - i) / (float)fade;
-                seg.L[(size_t)i] *= w; seg.R[(size_t)i] *= w;
+                const float xl = pre[0].process(b.L[(size_t)i]) * 0.25f, xr = pre[1].process(b.R[(size_t)i]) * 0.25f;
+                const float bb = blendB(i);
+                float yl = 0, yr = 0;
+                for (size_t v = 0; v < voices; ++v) {
+                    const float fa = fold(rootHz * semisToRatio(chordA[v])), fb2 = fold(rootHz * semisToRatio(chordB[v]));
+                    const float f = fa * std::pow(fb2 / fa, bb);
+                    const float d = sr / f * (v & 1 ? 1.003f : 0.997f);
+                    auto rd = [&](const std::vector<float>& z) {
+                        float pos = (float)w - d; while (pos < 0) pos += (float)maxD;
+                        const int i0 = (int)pos % maxD, i1 = (i0 + 1) % maxD; const float fr = pos - std::floor(pos);
+                        return z[(size_t)i0] * (1 - fr) + z[(size_t)i1] * fr;
+                    };
+                    const float ol = rd(zl[v]), orr = rd(zr[v]);
+                    lpL[v] = 0.6f * ol + 0.4f * lpL[v]; lpR[v] = 0.6f * orr + 0.4f * lpR[v];
+                    zl[v][(size_t)w] = xl + fbk * lpL[v];
+                    zr[v][(size_t)w] = xr + fbk * lpR[v];
+                    yl += ol; yr += orr;
+                }
+                wet.L[(size_t)i] = yl; wet.R[(size_t)i] = yr;
+                if (++w >= maxD) w = 0;
             }
-            float g = 1.f;
-            for (int j = 1; j <= repeats; ++j) {
-                g *= decay;
-                const int at = k + j * chunk;
-                const float pl = (j & 1) ? 0.3f : 1.f, pr = (j & 1) ? 1.f : 0.3f;
-                for (int i = 0; i < n && at + i < out.size(); ++i) {
-                    out.L[(size_t)(at + i)] += g * pl * seg.L[(size_t)i];
-                    out.R[(size_t)(at + i)] += g * pr * seg.R[(size_t)i];
+        } else {
+            const size_t voices = chordA.size();
+            for (size_t v = 0; v < voices; ++v) {
+                PitchShifter pa[2], pb[2];
+                const int win = b.sr * 45 / 1000;
+                const float det = v & 1 ? 0.06f : -0.06f;
+                for (auto& p : pa) p.init(win, semisToRatio(chordA[v] + det));
+                for (auto& p : pb) p.init(win, semisToRatio(chordB[v] + det));
+                const float pan = voices > 1 ? -0.6f + 1.2f * (float)v / (float)(voices - 1) : 0.f;
+                const float gl = std::sqrt(0.5f * (1 - pan)) * 1.41421f, gr = std::sqrt(0.5f * (1 + pan)) * 1.41421f;
+                for (int i = 0; i < n; ++i) {
+                    const float bb = blendB(i);
+                    const float l = pa[0].process(b.L[(size_t)i]) * (1 - bb) + pb[0].process(b.L[(size_t)i]) * bb;
+                    const float rr = pa[1].process(b.R[(size_t)i]) * (1 - bb) + pb[1].process(b.R[(size_t)i]) * bb;
+                    wet.L[(size_t)i] += l * gl * 0.7f; wet.R[(size_t)i] += rr * gr * 0.7f;
                 }
             }
         }
-        mixInto(b, out, mix);
+        float dry = 0, we = 0;
+        for (int i = 0; i < n; ++i) { dry += b.L[(size_t)i] * b.L[(size_t)i]; we += wet.L[(size_t)i] * wet.L[(size_t)i]; }
+        const float k = we > 1e-12f ? std::min(8.f, std::sqrt(dry / we)) : 1.f;
+        for (int i = 0; i < n; ++i) { b.L[(size_t)i] = b.L[(size_t)i] * (1.f - 0.5f * mix) + mix * k * wet.L[(size_t)i]; b.R[(size_t)i] = b.R[(size_t)i] * (1.f - 0.5f * mix) + mix * k * wet.R[(size_t)i]; }
     }
     std::string describe() const override {
-        return fmt("结晶回声（切片 %s，%s%+d 半音，重复 %d 次，衰减 %d%%，湿 %d%%）", beatsName(chunkBeats).c_str(),
-                   reverse ? "倒放，" : "", (int)semis, repeats, (int)(decay * 100), (int)(mix * 100));
+        static const char* names[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+        const int midi = (int)std::lround(69.f + 12.f * std::log2(rootHz / 440.f));
+        auto list = [](const std::vector<float>& c) { std::string s; for (float v : c) s += (s.empty() ? "" : ",") + fmt("%+d", (int)v); return s; };
+        std::string s = fmt("%s（根音 %s，和弦音程 %s", mode == Resonate ? "和弦共鸣" : "和声叠加", names[((midi % 12) + 12) % 12], list(chordA).c_str());
+        if (change) s += "，强拍换到 " + list(chordB);
+        if (mode == Resonate) s += fmt("，共鸣 %d%%", (int)(fbk * 100));
+        return s + fmt("，湿 %d%%）", (int)(mix * 100));
     }
 };
 
@@ -401,7 +612,8 @@ class Granular : public Effect {
 public:
     float density, sprayBeats, reverseProb, mix;
     int grainMs;
-    bool freeze;
+    bool freeze, synced = false;
+    float stepBeats = 0.25f;
     std::vector<float> pitches;
     uint64_t seed;
     Granular(Rng& r, const FxLimits& lim) {
@@ -412,7 +624,9 @@ public:
         mix = r.range(0.3f, 0.9f);
         freeze = r.chance(0.3f);
         pitches = lim.allowPitch ? std::vector<float>{0.f, 12.f, -12.f, 7.f} : std::vector<float>{0.f};
-        if (lim.allowPitch && r.chance(0.5f)) pitches = {0.f, 12.f};
+        if (lim.allowPitch && r.chance(0.5f)) pitches = r.pick<std::vector<float>>({{0.f, 12.f}, {0.f, 3.f, 7.f, 12.f}, {0.f, 7.f, 12.f, 19.f}, {-12.f, 0.f, 5.f}});
+        synced = r.chance(0.4f);
+        stepBeats = r.pick<float>({0.25f, 0.125f, 1.f / 6.f});
         seed = r.next();
     }
     void process(Buffer& b, const Timeline& t, const Region& reg) override {
@@ -432,7 +646,12 @@ public:
             e = std::max(e, t.downbeat);
         }
         const double step = (double)b.sr / density;
-        for (double tpos = a; tpos < e; tpos += step * r.range(0.5f, 1.5f)) {
+        const double gridStep = (double)std::max(64, t.beats(stepBeats));
+        // synced: grains on a tempo grid counted back from the junction, like a rhythmic resynth
+        double tpos = synced ? (double)t.downbeat - std::floor((double)(t.downbeat - a) / gridStep) * gridStep : (double)a;
+        for (; tpos < e; tpos += synced ? gridStep : step * r.range(0.5f, 1.5f)) {
+            if (tpos < 0) continue;
+            if (synced && !r.chance(0.75f)) continue;
             const int at = (int)tpos;
             int src = freeze ? frozen + (int)r.range(-0.02f * b.sr, 0.02f * b.sr) : at - (int)(r.uni() * (float)spray);
             src = std::clamp(src, 0, std::max(0, b.size() - g - 1));
@@ -443,7 +662,7 @@ public:
             const int len = (int)((float)g / ratio);
             for (int i = 0; i < len && at + i < out.size(); ++i) {
                 const double sp = rev ? (double)src + (double)(len - 1 - i) * ratio : (double)src + (double)i * ratio;
-                const float w = hann(i, len) * 0.7f;
+                const float w = synced ? std::min(1.f, (float)i / 96.f) * std::exp(-4.f * (float)i / (float)len) : hann(i, len) * 0.7f;
                 const float m = 0.5f * (readCubic(b.L, sp) + readCubic(b.R, sp));
                 out.L[(size_t)(at + i)] += m * w * gl;
                 out.R[(size_t)(at + i)] += m * w * gr;
@@ -460,12 +679,251 @@ public:
     std::string describe() const override {
         std::string p;
         for (float v : pitches) p += (p.empty() ? "" : "/") + fmt("%+d", (int)v);
+        if (synced) return fmt("节奏粒子重组（%s每 %s 一粒，颗粒 %dms，散布 %.2f 拍，倒放 %d%%，音高 %s，湿 %d%%）", freeze ? "冻结，" : "", beatsName(stepBeats).c_str(),
+                               grainMs, sprayBeats, (int)(reverseProb * 100), p.c_str(), (int)(mix * 100));
         return fmt("粒子云（%s密度 %.0f 粒/秒，颗粒 %dms，散布 %.2f 拍，倒放 %d%%，音高 %s，湿 %d%%）", freeze ? "冻结，" : "", density,
                    grainMs, sprayBeats, (int)(reverseProb * 100), p.c_str(), (int)(mix * 100));
     }
 };
 
 } // namespace
+
+// ------------------------------------------------------------------ Shaper (ShaperBox-style)
+// 1-3 modules, each driven by a tempo-synced shape (LFO). A module can work on one band only.
+class Shaper : public Effect {
+public:
+    enum Mod { Volume, Filter, Pan, Time, Crush, Width, Noise, ModCount };
+    enum Wave { SawUp, SawDown, Tri, Square, Pump, Steps, Sine, WaveCount };
+    enum Band { Full, Low, Mid, High };
+    struct Module {
+        Mod mod = Volume;
+        Wave wave = Sine;
+        Band band = Full;
+        float rate = 0.5f;      // beats per cycle
+        bool accel = false;     // rate speeds up 4x into the junction
+        float afterMul = 1.f;   // rate multiplier after the junction (2 = half time)
+        float depth = 0.8f;
+        int filterType = 0;     // 0 LP 1 HP 2 BP
+        float fLo = 200, fHi = 8000, q = 1;
+        int timeMode = 0;       // 0 half-speed, 1 scratch, 2 rewind tail
+        uint64_t seed = 1;
+    };
+    std::vector<Module> mods;
+
+    Shaper(Rng& r, const FxLimits& lim) {
+        const int n = 1 + r.weighted({0.45f, 0.4f, 0.15f});
+        std::vector<float> mw{1.2f, 1.4f, 0.8f, 0.9f, 0.7f, 0.5f, 0.6f};
+        if (lim.lowRegister) { mw[Pan] = 0; mw[Width] = 0; mw[Noise] = 0.2f; mw[Crush] *= 0.5f; }
+        if (!lim.allowPitch) mw[Time] *= 0.3f;
+        for (int k = 0; k < n; ++k) {
+            Module m;
+            m.mod = (Mod)r.weighted(mw);
+            mw[m.mod] = 0; // no two modules of the same kind
+            m.wave = (Wave)r.irange(0, WaveCount - 1);
+            m.rate = r.pick<float>({0.25f, 0.5f, 0.5f, 1.f, 1.f / 3.f, 0.125f, 2.f});
+            m.accel = r.chance(0.35f);
+            m.afterMul = r.pick<float>({1.f, 1.f, 2.f, 0.5f});
+            m.depth = r.range(0.5f, 1.f);
+            m.band = (m.mod == Time || m.mod == Pan || m.mod == Width || m.mod == Noise || r.chance(0.55f)) ? Full
+                     : (Band)r.irange(1, 3);
+            if (lim.lowRegister && m.band == Full && (m.mod == Volume || m.mod == Crush) && r.chance(0.5f)) m.band = Mid;
+            m.filterType = r.weighted({0.5f, 0.3f, 0.2f});
+            m.fLo = r.logRange(80.f, 600.f);
+            m.fHi = r.logRange(2500.f, 14000.f);
+            m.q = r.logRange(0.7f, 7.f);
+            m.timeMode = r.irange(0, 2);
+            if (m.mod == Time) { m.rate = r.pick<float>({0.5f, 1.f, 0.25f}); m.accel = false; }
+            m.seed = r.next();
+            mods.push_back(m);
+        }
+    }
+
+    static float shape(Wave w, float p, int cycle, uint64_t seed) {
+        switch (w) {
+        case SawUp: return p;
+        case SawDown: return 1.f - p;
+        case Tri: return 1.f - std::fabs(2.f * p - 1.f);
+        case Square: return p < 0.5f ? 1.f : 0.f;
+        case Pump: return 1.f - std::exp(-p * 7.f);
+        case Steps: {
+            uint64_t z = seed + (uint64_t)(cycle + 1000) * 0x9E3779B97F4A7C15ull;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; z ^= z >> 31;
+            return (float)(z >> 40) / 16777216.f;
+        }
+        case Sine: default: return 0.5f - 0.5f * std::cos(2.f * kPi * p);
+        }
+    }
+
+    // phase (in cycles) for every sample, grid-locked to the junction
+    std::vector<double> phases(const Module& m, const Timeline& t, int n) const {
+        std::vector<double> ph((size_t)n);
+        const double beat = (double)t.beat();
+        const double cyc = m.rate * beat;
+        // before the junction: count cycles backwards from the junction so a cycle always ends on it
+        double acc = 0;
+        for (int i = std::min(n, t.downbeat) - 1; i >= 0; --i) {
+            double rate = 1.0 / cyc;
+            if (m.accel) rate *= 1.0 + 3.0 * std::max(0.0, 1.0 - (double)(t.downbeat - i) / (double)std::max(1, t.downbeat));
+            acc -= rate;
+            ph[(size_t)i] = acc;
+        }
+        acc = 0;
+        for (int i = t.downbeat; i < n; ++i) { ph[(size_t)i] = acc; acc += 1.0 / (cyc * m.afterMul); }
+        return ph;
+    }
+
+    void process(Buffer& b, const Timeline& t, const Region& r) override {
+        const int n = b.size();
+        const int a = std::clamp(r.start, 0, n);
+        const float sr = (float)b.sr;
+        const int protect = t.beats(0.125f); // the junction itself stays clean so the peak survives
+        for (const Module& m : mods) {
+            const auto ph = phases(m, t, n);
+            auto val = [&](int i) {
+                const double c = ph[(size_t)i], fl = std::floor(c);
+                return shape(m.wave, (float)(c - fl), (int)fl, m.seed);
+            };
+            auto amt = [&](int i) { // depth, faded out right around the junction
+                const int d = std::abs(i - t.downbeat);
+                return m.depth * std::clamp((float)d / (float)std::max(1, protect), 0.f, 1.f);
+            };
+            // band split: work on `part`, keep `rest`
+            Buffer part = b, rest(n, b.sr);
+            if (m.band != Full) {
+                const float f1 = m.band == Low ? 0.f : m.band == Mid ? 200.f : 3000.f;
+                const float f2 = m.band == Low ? 200.f : m.band == Mid ? 3000.f : 0.f;
+                for (int ch = 0; ch < 2; ++ch) {
+                    auto& x = ch ? b.R : b.L;
+                    auto& p = ch ? part.R : part.L;
+                    auto& q = ch ? rest.R : rest.L;
+                    Biquad h1, h2, l1, l2;
+                    if (f1 > 0) { h1.set(Biquad::HP, f1, 0.7071f, 0, sr); h2 = h1; }
+                    if (f2 > 0) { l1.set(Biquad::LP, f2, 0.7071f, 0, sr); l2 = l1; }
+                    for (int i = 0; i < n; ++i) {
+                        float y = x[(size_t)i];
+                        if (f1 > 0) y = h2.process(h1.process(y));
+                        if (f2 > 0) y = l2.process(l1.process(y));
+                        p[(size_t)i] = y;
+                        q[(size_t)i] = x[(size_t)i] - y; // complementary (phase-approximate) remainder
+                    }
+                }
+            }
+            switch (m.mod) {
+            case Volume:
+                for (int i = a; i < n; ++i) { const float g = 1.f - amt(i) * (1.f - val(i)); part.L[(size_t)i] *= g; part.R[(size_t)i] *= g; }
+                break;
+            case Filter: {
+                Biquad fl[2];
+                const Biquad::Type ty = m.filterType == 0 ? Biquad::LP : m.filterType == 1 ? Biquad::HP : Biquad::BP;
+                for (int i = a; i < n; ++i) {
+                    if (((i - a) & 31) == 0) {
+                        const float v = m.filterType == 1 ? 1.f - val(i) : val(i);
+                        const float d = amt(i);
+                        // depth 0 -> filter fully open (LP high / HP low)
+                        const float open = m.filterType == 1 ? 0.f : 1.f;
+                        const float x = open + (v - open) * d;
+                        const float f = m.fLo * std::pow(m.fHi / m.fLo, x);
+                        const float q = ty == Biquad::BP ? std::max(0.7f, m.q * 0.5f) : 0.707f + (m.q - 0.707f) * d;
+                        for (auto& f0 : fl) { const float z1 = f0.z1, z2 = f0.z2; f0.set(ty, f, q, 0, sr); f0.z1 = z1; f0.z2 = z2; }
+                    }
+                    float yl = fl[0].process(part.L[(size_t)i]), yr = fl[1].process(part.R[(size_t)i]);
+                    if (ty == Biquad::BP) { const float d = amt(i); yl = part.L[(size_t)i] * (1 - d) + yl * d * 1.6f; yr = part.R[(size_t)i] * (1 - d) + yr * d * 1.6f; }
+                    part.L[(size_t)i] = yl; part.R[(size_t)i] = yr;
+                }
+                break;
+            }
+            case Pan:
+                for (int i = a; i < n; ++i) {
+                    const float p = (2.f * val(i) - 1.f) * amt(i);
+                    const float gl = std::sqrt(0.5f * (1 - p)) * 1.41421f, gr = std::sqrt(0.5f * (1 + p)) * 1.41421f;
+                    part.L[(size_t)i] *= gl; part.R[(size_t)i] *= gr;
+                }
+                break;
+            case Width:
+                for (int i = a; i < n; ++i) {
+                    const float mid = 0.5f * (part.L[(size_t)i] + part.R[(size_t)i]), side = 0.5f * (part.L[(size_t)i] - part.R[(size_t)i]);
+                    const float w = 1.f + amt(i) * (2.f * val(i) - 1.f); // 0 (mono) .. 2 (wide)
+                    part.L[(size_t)i] = mid + side * w; part.R[(size_t)i] = mid - side * w;
+                }
+                break;
+            case Crush: {
+                float holdL = 0, holdR = 0; int cnt = 0;
+                for (int i = a; i < n; ++i) {
+                    const float k = amt(i) * (1.f - val(i));
+                    const int hold = 1 + (int)std::lround(k * 15.f);
+                    if (cnt <= 0) { holdL = part.L[(size_t)i]; holdR = part.R[(size_t)i]; cnt = hold; }
+                    --cnt;
+                    const float steps = std::pow(2.f, 16.f - 12.f * k);
+                    part.L[(size_t)i] = std::round(holdL * steps) / steps;
+                    part.R[(size_t)i] = std::round(holdR * steps) / steps;
+                }
+                break;
+            }
+            case Noise: {
+                // a noise layer that breathes with the shape, scaled to the sound's own level
+                Rng nr(m.seed);
+                Biquad hl, hr; hl.set(Biquad::HP, 3000.f, 0.7f, 0, sr); hr = hl;
+                float env = 0;
+                const float att = std::exp(-1.f / (0.005f * sr)), rel = std::exp(-1.f / (0.15f * sr));
+                for (int i = a; i < n; ++i) {
+                    const float x = std::max(std::fabs(part.L[(size_t)i]), std::fabs(part.R[(size_t)i]));
+                    env = x > env ? att * env + (1 - att) * x : rel * env + (1 - rel) * x;
+                    const float g = 0.15f * env * amt(i) * val(i);
+                    part.L[(size_t)i] += hl.process(nr.range(-1.f, 1.f)) * g;
+                    part.R[(size_t)i] += hr.process(nr.range(-1.f, 1.f)) * g;
+                }
+                break;
+            }
+            case Time: {
+                // re-read each cycle: half speed, scratch (forward then back) or rewind (second half reversed)
+                const Buffer src = part;
+                for (int i = a; i < n; ++i) {
+                    const double c = ph[(size_t)i], fl = std::floor(c);
+                    const double p = c - fl;
+                    double cycLen = (double)t.beats(m.rate) * (i >= t.downbeat ? m.afterMul : 1.0);
+                    const double cycStart = (double)i - p * cycLen;
+                    double rel;
+                    if (m.timeMode == 0) rel = p * 0.5;                                // half speed
+                    else if (m.timeMode == 1) rel = 0.5 * (1.0 - std::fabs(2.0 * p - 1.0)) + 0.25 * p; // scratch
+                    else rel = p < 0.5 ? p : 1.0 - p;                                  // rewind
+                    const float d = amt(i);
+                    const double pos = (double)i * (1.0 - d) + (cycStart + rel * cycLen) * d;
+                    // 3 ms crossfade at each cycle start against the straight read
+                    const double fade = std::min(1.0, p * cycLen / (0.003 * sr));
+                    part.L[(size_t)i] = (float)(readCubic(src.L, pos) * fade + src.L[(size_t)i] * (1.0 - fade));
+                    part.R[(size_t)i] = (float)(readCubic(src.R, pos) * fade + src.R[(size_t)i] * (1.0 - fade));
+                }
+                break;
+            }
+            default: break;
+            }
+            if (m.band == Full) b = std::move(part);
+            else for (int i = 0; i < n; ++i) { b.L[(size_t)i] = part.L[(size_t)i] + rest.L[(size_t)i]; b.R[(size_t)i] = part.R[(size_t)i] + rest.R[(size_t)i]; }
+        }
+    }
+
+    std::string describe() const override {
+        static const char* modN[] = {"音量", "滤波", "声像", "变速", "压碎", "宽度", "噪声"};
+        static const char* waveN[] = {"锯齿上", "锯齿下", "三角", "方波", "泵", "随机阶梯", "正弦"};
+        static const char* bandN[] = {"", "（只动低频）", "（只动中频）", "（只动高频）"};
+        static const char* timeN[] = {"半速", "搓碟", "倒带"};
+        static const char* fN[] = {"低通", "高通", "带通"};
+        std::string s = "节奏塑形器（";
+        for (size_t k = 0; k < mods.size(); ++k) {
+            const Module& m = mods[k];
+            if (k) s += "；";
+            s += std::string(modN[m.mod]);
+            if (m.mod == Time) s += std::string("·") + timeN[m.timeMode];
+            if (m.mod == Filter) s += fmt("·%s %.0f–%.0fHz Q%.1f", fN[m.filterType], m.fLo, m.fHi, m.q);
+            s += fmt(" %s 形状，每 %s 一次，深度 %.0f%%", waveN[m.wave], beatsName(m.rate).c_str(), m.depth * 100);
+            if (m.accel) s += "，越近强拍越快";
+            if (m.afterMul == 2.f) s += "，强拍后半速";
+            if (m.afterMul == 0.5f) s += "，强拍后加倍";
+            s += bandN[m.band];
+        }
+        return s + "）";
+    }
+};
 
 const char* fxName(FxType t) {
     switch (t) {
@@ -477,6 +935,9 @@ const char* fxName(FxType t) {
     case FxType::Crystal: return "结晶回声";
     case FxType::Stutter: return "卡顿连击";
     case FxType::Granular: return "粒子云";
+    case FxType::Shaper: return "节奏塑形器";
+    case FxType::GrainDelay: return "颗粒延迟";
+    case FxType::Chroma: return "和声/共鸣";
     default: return "?";
     }
 }
@@ -491,6 +952,9 @@ std::unique_ptr<Effect> makeEffect(FxType t, Rng& rng, const FxLimits& lim, cons
     case FxType::Crystal: return std::make_unique<Crystal>(rng, lim);
     case FxType::Stutter: return std::make_unique<Stutter>(rng, lim, tl);
     case FxType::Granular: return std::make_unique<Granular>(rng, lim);
+    case FxType::Shaper: return std::make_unique<Shaper>(rng, lim);
+    case FxType::GrainDelay: return std::make_unique<GrainDelay>(rng, lim);
+    case FxType::Chroma: return std::make_unique<Chroma>(rng, lim);
     default: return nullptr;
     }
 }
