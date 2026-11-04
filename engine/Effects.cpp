@@ -223,7 +223,7 @@ public:
         jitterBeats = r.range(0.f, 0.25f);
         reverseProb = r.range(0.f, 0.5f);
         grainMs = r.range(35.f, 180.f);
-        synced = r.chance(0.4f);
+        synced = r.chance(0.4f) && false; // rhythmic grain mode off (user 11/4)
         if (lim.allowPitch) pitches = r.pick<std::vector<float>>({{12.f}, {12.f, 0.f}, {7.f, 12.f}, {-12.f, 0.f}, {12.f, 19.f, 24.f}, {0.f, 5.f, 12.f}, {-5.f, 7.f}, {0.f, 0.1f, -0.1f}});
         else pitches = {0.f, 0.f, 12.f};
         seed = r.next();
@@ -625,7 +625,7 @@ public:
         freeze = r.chance(0.3f);
         pitches = lim.allowPitch ? std::vector<float>{0.f, 12.f, -12.f, 7.f} : std::vector<float>{0.f};
         if (lim.allowPitch && r.chance(0.5f)) pitches = r.pick<std::vector<float>>({{0.f, 12.f}, {0.f, 3.f, 7.f, 12.f}, {0.f, 7.f, 12.f, 19.f}, {-12.f, 0.f, 5.f}});
-        synced = r.chance(0.4f);
+        synced = r.chance(0.4f) && false; // rhythmic grain mode off (user 11/4)
         stepBeats = r.pick<float>({0.25f, 0.125f, 1.f / 6.f});
         seed = r.next();
     }

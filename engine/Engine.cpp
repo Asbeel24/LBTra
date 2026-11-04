@@ -61,7 +61,7 @@ Role pickRole(const Analysis& a, Rng& r, bool arrangeOnly) {
 
 std::vector<float> fxWeights(const Analysis& a, Style st, Role role) {
     //               Reverb RevRev Delay  Eq   Dist Crystal Stutter Gran Shaper GrainDly Chroma
-    std::vector<float> w{0.9f, 0.6f, 1.0f, 0.8f, 0.6f, 1.0f, 0.5f, 0.6f, 1.4f, 1.1f, 0.9f};
+    std::vector<float> w{0.9f, 0.6f, 1.0f, 0.8f, 0.6f, 1.0f, 0.5f, 0.6f, 0.0f, 1.1f, 0.9f}; // Shaper off (user 11/4)
     auto mul = [&](FxType t, float m) { w[(size_t)t] *= m; };
     switch (st) {
     case Style::Dirty: mul(FxType::Distortion, 3.f); mul(FxType::Stutter, 1.5f); mul(FxType::Shaper, 1.5f); mul(FxType::Reverb, 0.5f); mul(FxType::ReverseReverb, 0.5f); break;
@@ -90,10 +90,10 @@ EnvelopeChoice pickEnvelope(Role role, const Analysis& a, Rng& r) {
     using K = EnvelopeChoice::Kind;
     switch (role) {
     case Role::Build:
-    case Role::BuildReverse: e.kind = r.pick<K>({K::Swell, K::LowpassOpen, K::HighpassRise, K::Pump}); break;
+    case Role::BuildReverse: e.kind = r.pick<K>({K::Swell, K::LowpassOpen, K::HighpassRise}); break;
     case Role::Hit:
-    case Role::Roll: e.kind = a.reg == Register::Low ? r.pick<K>({K::Dive, K::TapeStop, K::FadeOut}) : r.pick<K>({K::TapeStop, K::Dive, K::FadeOut, K::Pump}); break;
-    case Role::Fill: e.kind = r.pick<K>({K::Swell, K::LowpassOpen, K::Pump, K::FadeOut, K::TapeStop}); break;
+    case Role::Roll: e.kind = a.reg == Register::Low ? r.pick<K>({K::Dive, K::TapeStop, K::FadeOut}) : r.pick<K>({K::TapeStop, K::Dive, K::FadeOut}); break;
+    case Role::Fill: e.kind = r.pick<K>({K::Swell, K::LowpassOpen, K::FadeOut, K::TapeStop}); break;
     case Role::Downlift: e.kind = r.pick<K>({K::FadeOut, K::Dive, K::TapeStop}); break;
     case Role::Pattern: e.kind = r.pick<K>({K::FadeOut, K::Dive}); break;
     }
@@ -476,15 +476,15 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
             if (req.arrangeOnly) {
                 t.vol = build ? Track::Swell : Track::Decay;
             } else if (build) {
-                t.vol = (Track::VolShape)(Track::Swell + rng.weighted({3.f, 2.f, 2.f, 2.f}));
+                t.vol = (Track::VolShape)(Track::Swell + rng.weighted({1.f, 0.f, 0.f, 0.f})); // rhythmic shapes off for now (user 11/4)
                 t.autoDepth = t.vol == Track::Swell ? rng.range(24.f, 40.f) : rng.range(14.f, 24.f);
                 t.volStep = req.lengthBeats >= 4.f ? rng.pick<float>({1.f, 0.5f}) : req.lengthBeats >= 1.f ? rng.pick<float>({0.5f, 0.25f}) : 0.125f;
                 if (t.vol == Track::GateRise) t.volStep = std::min(t.volStep, 0.25f);
                 if (rng.chance(0.5f)) t.cutAfter = rng.pick<float>({0.25f, 0.5f, 1.f});
             } else {
                 const bool low = a.reg == Register::Low;
-                t.vol = low ? (Track::VolShape)(Track::Decay + rng.weighted({3.f, 2.f, 1.f}))
-                            : (Track::VolShape)(Track::Decay + rng.weighted({3.f, 2.f, 2.f, 2.f}));
+                t.vol = low ? (Track::VolShape)(Track::Decay + rng.weighted({3.f, 2.f, 0.f}))
+                            : (Track::VolShape)(Track::Decay + rng.weighted({3.f, 2.f, 0.f, 0.f}));
                 t.autoDepth = rng.range(14.f, 30.f);
                 t.autoCurve = rng.range(0.5f, 1.2f);
                 t.volStep = t.vol == Track::Cut ? rng.pick<float>({0.25f, 0.5f, 1.f}) : rng.pick<float>({0.5f, 0.25f});
@@ -623,7 +623,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
     if (req.forcedOutput) out = *req.forcedOutput;
     else {
         const float gp = req.style == Style::Dirty || req.style == Style::Fragment ? 0.6f : (req.style == Style::Ambient ? 0.15f : 0.3f);
-        out.gate = rng.chance(gp);
+        out.gate = rng.chance(gp) && false; // gate comes back later as a user toggle (user 11/4)
         out.gateStepBeats = rng.pick<float>({0.25f, 0.125f});
         const float dens = rng.range(0.5f, 0.8f);
         out.gatePattern = 0;
