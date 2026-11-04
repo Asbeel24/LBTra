@@ -16,3 +16,40 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release
+
+  plugin:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: LBTra-mac
+          - os: windows-latest
+            name: LBTra-windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLBTRA_BUILD_PLUGIN=ON -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+          else
+            cmake -S . -B build -DLBTRA_BUILD_PLUGIN=ON
+          fi
+      - name: Build
+        run: cmake --build build --config Release --target LBTra_All
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          A=build/LBTra_artefacts/Release
+          cp -R "$A/VST3/LBTra.vst3" dist/
+          [ -d "$A/AU/LBTra.component" ] && cp -R "$A/AU/LBTra.component" dist/ || true
+          [ -d "$A/Standalone/LBTra.app" ] && cp -R "$A/Standalone/LBTra.app" dist/ || true
+          [ -f "$A/Standalone/LBTra.exe" ] && cp "$A/Standalone/LBTra.exe" dist/ || true
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist

@@ -70,6 +70,9 @@ struct OutputOptions {
     bool finalReverb = false;
     float finalReverbMix = 0.25f;
     enum EqMode { EqOff, Telephone, Darken } finalEq = EqOff;
+    float gateDepth = 1.f;   // 0..1, how far closed steps go down
+    float wide = 0.f;        // 0..1 stereo width above 200 Hz (0 = off)
+    float bass = 0.f;        // 0..1 low shelf + sub saturation (0 = off)
     std::string describe() const;
 };
 void processOutput(Buffer& b, const OutputOptions& o, const Timeline& t);

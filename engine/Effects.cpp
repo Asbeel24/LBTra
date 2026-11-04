@@ -1217,12 +1217,14 @@ std::string OutputOptions::describe() const {
     if (gate) {
         std::string pat;
         for (int k = 0; k < 16; ++k) pat += (gatePattern >> k & 1u) ? "x" : ".";
-        s += fmt("门限切片 开（%s 步，图案 %s，只作用在强拍前）", beatsName(gateStepBeats).c_str(), pat.c_str());
+        s += fmt("门限切片 开（%s 步，图案 %s，深度 %d%%，只作用在强拍前）", beatsName(gateStepBeats).c_str(), pat.c_str(), (int)(gateDepth * 100));
     } else s += "门限切片 关";
     s += finalReverb ? fmt("；最终混响 开（湿 %d%%）", (int)(finalReverbMix * 100)) : std::string("；最终混响 关");
     if (finalEq == Telephone) s += "；最终 EQ：电话音色（强拍前变窄，强拍恢复全频）";
     else if (finalEq == Darken) s += "；最终 EQ：压暗（4kHz 低通）";
     else s += "；最终 EQ 关";
+    if (bass > 0.001f) s += fmt("；Bass %d%%（低架 +%.1fdB，加饱和低频）", (int)(bass * 100), 8.f * bass);
+    if (wide > 0.001f) s += fmt("；Wide %d%%（200Hz 以上加宽）", (int)(wide * 100));
     return s;
 }
 
@@ -1255,10 +1257,33 @@ void processOutput(Buffer& b, const OutputOptions& o, const Timeline& t) {
             if (i < t.downbeat) {
                 const int k = ((t.downbeat - 1 - i) / step); // count steps backwards from the downbeat
                 const int idx = 15 - (k % 16);
-                target = (o.gatePattern >> idx & 1u) ? 1.f : 0.f;
+                target = (o.gatePattern >> idx & 1u) ? 1.f : 1.f - std::clamp(o.gateDepth, 0.f, 1.f);
             }
             g += (target - g) * std::min(1.f, coef * 2.f);
             b.L[(size_t)i] *= g; b.R[(size_t)i] *= g;
+        }
+    }
+    if (o.bass > 0.001f) {
+        // low shelf lift plus saturated sub (harmonics make it audible on small speakers)
+        Biquad sh[2], lp[2];
+        for (auto& f : sh) f.set(Biquad::LowShelf, 90.f, 0.707f, 8.f * o.bass, sr);
+        for (auto& f : lp) f.set(Biquad::LP, 120.f, 0.707f, 0, sr);
+        const float drive = 1.f + 5.f * o.bass, mixS = 0.35f * o.bass;
+        for (int i = 0; i < b.size(); ++i) {
+            const float l = sh[0].process(b.L[(size_t)i]), r = sh[1].process(b.R[(size_t)i]);
+            const float sl = std::tanh(lp[0].process(l) * drive) / drive, sr2 = std::tanh(lp[1].process(r) * drive) / drive;
+            b.L[(size_t)i] = l + mixS * sl; b.R[(size_t)i] = r + mixS * sr2;
+        }
+    }
+    if (o.wide > 0.001f) {
+        // widen only above 200 Hz so the low end stays mono
+        Biquad hp; hp.set(Biquad::HP, 200.f, 0.707f, 0, sr);
+        const float k = 1.f + 1.2f * o.wide;
+        for (int i = 0; i < b.size(); ++i) {
+            const float m = 0.5f * (b.L[(size_t)i] + b.R[(size_t)i]), sd = 0.5f * (b.L[(size_t)i] - b.R[(size_t)i]);
+            const float sdh = hp.process(sd);
+            const float s2 = sd + (k - 1.f) * sdh;
+            b.L[(size_t)i] = m + s2; b.R[(size_t)i] = m - s2;
         }
     }
     if (o.finalReverb) {
