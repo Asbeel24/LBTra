@@ -2,224 +2,486 @@
 
 namespace {
 juce::String u8(const char* s) { return juce::String::fromUTF8(s); }
-const juce::Colour kBg(0xff121317), kPanel(0xff1c1e24), kLine(0xff2c2f38), kText(0xffe8e8ea), kDim(0xff8a8d96), kAccent(0xffff7a3d), kWave(0xff6ec6ff);
+const juce::Colour kBg(0xff0e0e10), kPanel(0xff151518), kLine(0xff26262c), kText(0xffececef), kDim(0xff7c7c85), kFaint(0xff3a3a42),
+    kAccent(0xffff6a3d);
+juce::Font font(float h, bool bold = false) { return juce::Font(juce::FontOptions(h, bold ? juce::Font::bold : juce::Font::plain)); }
 } // namespace
 
-// ------------------------------------------------------------------ slot
-void LBTraEditor::SlotView::paint(juce::Graphics& g) {
-    auto r = getLocalBounds().toFloat().reduced(2);
-    g.setColour(hover ? kLine.brighter(0.3f) : kPanel);
-    g.fillRoundedRectangle(r, 6);
+// ------------------------------------------------------------------ look
+LBTraEditor::Look::Look() {
+    setColour(juce::ComboBox::textColourId, kText);
+    setColour(juce::PopupMenu::backgroundColourId, kPanel);
+    setColour(juce::PopupMenu::textColourId, kText);
+    setColour(juce::PopupMenu::highlightedBackgroundColourId, kLine);
+    setColour(juce::PopupMenu::highlightedTextColourId, kText);
+    setColour(juce::TextEditor::backgroundColourId, kBg);
+    setColour(juce::TextEditor::textColourId, kDim);
+    setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
+    setColour(juce::TextEditor::focusedOutlineColourId, juce::Colours::transparentBlack);
+    setColour(juce::ScrollBar::thumbColourId, kFaint);
+}
+void LBTraEditor::Look::drawComboBox(juce::Graphics& g, int w, int h, bool, int, int, int, int, juce::ComboBox&) {
     g.setColour(kLine);
-    g.drawRoundedRectangle(r, 6, 1);
-    const auto& s = ed.proc.slot(index);
-    auto inner = getLocalBounds().reduced(10, 8);
+    g.drawLine(0.f, (float)h - 0.5f, (float)w, (float)h - 0.5f, 1.f);
+    juce::Path p;
+    const float cx = (float)w - 8.f, cy = (float)h * 0.5f;
+    p.addTriangle(cx - 3.5f, cy - 2.f, cx + 3.5f, cy - 2.f, cx, cy + 2.5f);
     g.setColour(kDim);
-    g.setFont(juce::FontOptions(12.f));
-    g.drawText(u8("声音 ") + juce::String(index + 1), inner.removeFromTop(16), juce::Justification::left);
-    if (!s.loaded) {
-        g.setColour(kDim.withAlpha(0.7f));
-        g.drawFittedText(u8("把音频拖到这里\n或点击选择"), inner, juce::Justification::centred, 2);
-        return;
+    g.fillPath(p);
+}
+juce::Font LBTraEditor::Look::getComboBoxFont(juce::ComboBox&) { return font(13.f); }
+void LBTraEditor::Look::drawPopupMenuBackground(juce::Graphics& g, int w, int h) {
+    g.fillAll(kPanel);
+    g.setColour(kLine);
+    g.drawRect(0, 0, w, h);
+}
+void LBTraEditor::Look::drawToggleButton(juce::Graphics& g, juce::ToggleButton& b, bool, bool) {
+    const bool on = b.getToggleState();
+    auto r = b.getLocalBounds().toFloat();
+    auto dot = r.removeFromRight(r.getHeight()).reduced(r.getHeight() * 0.3f);
+    g.setColour(on ? kAccent : kFaint);
+    g.fillEllipse(dot);
+    g.setColour(on ? kText : kDim);
+    g.setFont(font(13.f));
+    g.drawText(b.getButtonText(), r, juce::Justification::centredLeft);
+}
+
+// ------------------------------------------------------------------ sample row
+class LBTraEditor::SampleRow : public juce::Component, public juce::FileDragAndDropTarget {
+public:
+    SampleRow(LBTraEditor& e, int i) : ed(e), index(i) {}
+    void refresh() {
+        const auto& s = ed.proc.slot(index);
+        thumb.clear();
+        if (s.loaded) {
+            const auto& a = s.source.audio;
+            const int bins = 160, n = a.size();
+            float mx = 1e-6f;
+            for (int k = 0; k < bins; ++k) {
+                float pk = 0;
+                for (int i = k * n / bins; i < (k + 1) * n / bins; ++i) pk = std::max(pk, std::max(std::fabs(a.L[(size_t)i]), std::fabs(a.R[(size_t)i])));
+                thumb.push_back(pk);
+                mx = std::max(mx, pk);
+            }
+            for (auto& v : thumb) v /= mx;
+        }
+        repaint();
     }
-    const auto& a = s.source.analysis;
-    g.setColour(kText);
-    g.setFont(juce::FontOptions(14.f, juce::Font::bold));
-    g.drawText(s.file.getFileNameWithoutExtension(), inner.removeFromTop(20), juce::Justification::left, true);
-    g.setFont(juce::FontOptions(12.f));
-    g.setColour(kAccent);
-    g.drawText(juce::String::fromUTF8(a.kindName().c_str()), inner.removeFromTop(17), juce::Justification::left, true);
-    g.setColour(kDim);
-    juce::String line = u8("形状 ") + juce::String::fromUTF8(a.shapeName().c_str()) + u8(" · ") + juce::String::fromUTF8(a.regName().c_str());
-    g.drawText(line, inner.removeFromTop(17), juce::Justification::left, true);
-    juce::String line2 = juce::String(a.duration, 2) + u8(" 秒");
-    if (a.f0 > 0) line2 += u8(" · ") + juce::String::fromUTF8(a.noteName().c_str());
-    g.drawText(line2, inner.removeFromTop(17), juce::Justification::left, true);
-    g.setColour(kDim.withAlpha(0.6f));
-    g.drawText(u8("右键清空"), inner.removeFromBottom(14), juce::Justification::right);
-}
-
-void LBTraEditor::SlotView::mouseDown(const juce::MouseEvent& e) {
-    if (e.mods.isPopupMenu()) { ed.proc.clearSlot(index); repaint(); return; }
-    chooser = std::make_unique<juce::FileChooser>(u8("选择音频"), juce::File(), "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg");
-    chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles, [this](const juce::FileChooser& fc) {
-        if (fc.getResult().existsAsFile()) ed.loadInto(index, fc.getResult());
-    });
-}
-
-void LBTraEditor::SlotView::filesDropped(const juce::StringArray& files, int, int) {
-    hover = false;
-    // several files at once fill this slot and the ones after it
-    int i = index;
-    for (auto& f : files) {
-        if (i >= LBTraProcessor::kSlots) break;
-        ed.loadInto(i++, juce::File(f));
-    }
-    repaint();
-}
-
-// ------------------------------------------------------------------ waveform
-void LBTraEditor::Waveform::paint(juce::Graphics& g) {
-    auto r = getLocalBounds().toFloat();
-    g.setColour(kPanel);
-    g.fillRoundedRectangle(r, 6);
-    auto cur = proc.current();
-    if (!cur || cur->audio.getNumSamples() == 0) {
+    void paint(juce::Graphics& g) override {
+        auto r = getLocalBounds();
+        g.setColour(hover ? kLine.withAlpha(0.6f) : juce::Colours::transparentBlack);
+        g.fillRect(r);
+        g.setColour(kLine);
+        g.drawLine(0.f, (float)getHeight() - 0.5f, (float)getWidth(), (float)getHeight() - 0.5f, 1.f);
+        const auto& s = ed.proc.slot(index);
+        auto num = r.removeFromLeft(34);
+        g.setColour(s.loaded ? kText : kFaint);
+        g.setFont(font(12.f));
+        g.drawText(juce::String(index + 1), num, juce::Justification::centred);
+        r.removeFromRight(10);
+        if (!s.loaded) {
+            g.setColour(kFaint);
+            g.setFont(font(13.f));
+            g.drawText("Drop sample", r, juce::Justification::centredLeft);
+            return;
+        }
+        const auto& a = s.source.analysis;
+        auto text = r.removeFromLeft(std::min(220, r.getWidth() / 2));
+        g.setColour(kText);
+        g.setFont(font(14.f));
+        g.drawText(s.file.getFileNameWithoutExtension(), text.removeFromTop(text.getHeight() / 2 + 3).withTrimmedBottom(1), juce::Justification::bottomLeft, true);
         g.setColour(kDim);
-        g.drawText(u8("放入声音后按“摇骰子”"), getLocalBounds(), juce::Justification::centred);
-        return;
+        g.setFont(font(11.f));
+        juce::String tag = juce::String::fromUTF8(a.shapeName().c_str()) + u8(" · ") + juce::String::fromUTF8(a.regName().c_str());
+        if (a.f0 > 0) tag += u8(" · ") + juce::String::fromUTF8(a.noteName().c_str());
+        g.drawText(tag, text.withTrimmedTop(2), juce::Justification::topLeft, true);
+        // waveform thumbnail
+        auto w = r.reduced(8, 12).toFloat();
+        g.setColour(kDim.withAlpha(0.55f));
+        const float mid = w.getCentreY(), hh = w.getHeight() * 0.5f;
+        for (size_t k = 0; k < thumb.size(); ++k) {
+            const float x = w.getX() + w.getWidth() * (float)k / (float)thumb.size();
+            g.drawVerticalLine((int)x, mid - thumb[k] * hh, mid + thumb[k] * hh + 1.f);
+        }
     }
-    const auto& a = cur->audio;
-    const int n = a.getNumSamples(), w = std::max(1, getWidth() - 16);
-    const float mid = r.getCentreY(), h = r.getHeight() * 0.42f;
-    g.setColour(kWave);
-    for (int x = 0; x < w; ++x) {
-        const int s0 = (int)((juce::int64)x * n / w), s1 = std::max(s0 + 1, (int)((juce::int64)(x + 1) * n / w));
-        float peak = 0;
-        for (int i = s0; i < s1 && i < n; ++i) peak = std::max(peak, std::max(std::fabs(a.getSample(0, i)), std::fabs(a.getSample(1, i))));
-        g.drawVerticalLine(8 + x, mid - peak * h, mid + peak * h);
+    void mouseDown(const juce::MouseEvent& e) override {
+        if (e.mods.isPopupMenu()) { ed.proc.clearSlot(index); refresh(); return; }
+        chooser = std::make_unique<juce::FileChooser>("Load sample", juce::File(), "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg");
+        chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles, [this](const juce::FileChooser& fc) {
+            if (fc.getResult().existsAsFile()) ed.loadInto(index, fc.getResult());
+        });
     }
-    const float jx = 8.f + (float)cur->downbeat / (float)n * (float)w;
-    g.setColour(kAccent);
-    g.drawLine(jx, r.getY() + 4, jx, r.getBottom() - 4, 2.f);
-    g.setFont(juce::FontOptions(12.f));
-    g.drawText(u8("衔接点"), (int)jx + 4, 4, 60, 16, juce::Justification::left);
-    g.setColour(kDim);
-    g.drawText(juce::String(cur->bpm, 1) + " BPM", getLocalBounds().reduced(8, 4), juce::Justification::topRight);
-}
+    bool isInterestedInFileDrag(const juce::StringArray&) override { return true; }
+    void fileDragEnter(const juce::StringArray&, int, int) override { hover = true; repaint(); }
+    void fileDragExit(const juce::StringArray&) override { hover = false; repaint(); }
+    void filesDropped(const juce::StringArray& files, int, int) override {
+        hover = false;
+        int i = index; // several files fill this row and the ones below it
+        for (auto& f : files) { if (i >= LBTraProcessor::kSlots) break; ed.loadInto(i++, juce::File(f)); }
+        repaint();
+    }
+private:
+    LBTraEditor& ed;
+    int index;
+    bool hover = false;
+    std::vector<float> thumb;
+    std::unique_ptr<juce::FileChooser> chooser;
+};
+
+// ------------------------------------------------------------------ dice
+class LBTraEditor::Dice : public juce::Component {
+public:
+    explicit Dice(LBTraEditor& e) : ed(e) { setMouseCursor(juce::MouseCursor::PointingHandCursor); }
+    void paint(juce::Graphics& g) override {
+        auto r = getLocalBounds().toFloat().reduced(4);
+        const float s = std::min(r.getWidth(), r.getHeight());
+        auto sq = juce::Rectangle<float>(s, s).withCentre(r.getCentre());
+        const bool busy = ed.proc.isRendering();
+        g.setColour(down ? kText.withAlpha(0.15f) : juce::Colours::transparentBlack);
+        g.fillRoundedRectangle(sq, s * 0.18f);
+        g.setColour(busy ? kAccent : (over ? kText : kText.withAlpha(0.85f)));
+        g.drawRoundedRectangle(sq, s * 0.18f, 1.6f);
+        const int pips[5][2] = {{0, 0}, {2, 0}, {1, 1}, {0, 2}, {2, 2}};
+        const float step = s * 0.28f, rad = s * 0.075f;
+        for (auto& p : pips) {
+            const float cx = sq.getX() + s * 0.22f + step * (float)p[0], cy = sq.getY() + s * 0.22f + step * (float)p[1];
+            g.fillEllipse(cx - rad, cy - rad, rad * 2, rad * 2);
+        }
+    }
+    void mouseEnter(const juce::MouseEvent&) override { over = true; repaint(); }
+    void mouseExit(const juce::MouseEvent&) override { over = false; repaint(); }
+    void mouseDown(const juce::MouseEvent&) override { down = true; repaint(); }
+    void mouseUp(const juce::MouseEvent& e) override {
+        down = false;
+        if (getLocalBounds().contains(e.getPosition())) ed.proc.rollDice();
+        repaint();
+    }
+private:
+    LBTraEditor& ed;
+    bool over = false, down = false;
+};
+
+// ------------------------------------------------------------------ Inst / Loop
+class LBTraEditor::ModeSwitch : public juce::Component {
+public:
+    explicit ModeSwitch(LBTraProcessor& p)
+        : param(*p.params.getParameter("mode")), att(param, [this](float) { repaint(); }) {}
+    void paint(juce::Graphics& g) override {
+        const bool loop = param.getValue() > 0.5f; // normalised: Inst = 0, Loop = 1
+        auto r = getLocalBounds().toFloat().reduced(1);
+        g.setColour(kLine);
+        g.drawRoundedRectangle(r, r.getHeight() * 0.5f, 1.f);
+        auto half = r.withWidth(r.getWidth() * 0.5f);
+        auto sel = loop ? half.withX(half.getRight()) : half;
+        g.setColour(kText);
+        g.fillRoundedRectangle(sel.reduced(2), sel.getHeight() * 0.5f - 2);
+        g.setFont(font(12.f, true));
+        g.setColour(loop ? kDim : kBg);
+        g.drawText("Inst", half, juce::Justification::centred);
+        g.setColour(loop ? kBg : kDim);
+        g.drawText("Loop", half.withX(half.getRight()), juce::Justification::centred);
+    }
+    void mouseDown(const juce::MouseEvent& e) override {
+        const bool loop = e.x > getWidth() / 2;
+        att.setValueAsCompleteGesture(loop ? 1.f : 0.f);
+        repaint();
+    }
+private:
+    juce::RangedAudioParameter& param;
+    juce::ParameterAttachment att;
+};
+
+// ------------------------------------------------------------------ switch + amount row (Gate, Comp, Wide, Bass, Shape)
+class LBTraEditor::SwitchRow : public juce::Component {
+public:
+    SwitchRow(LBTraProcessor& p, const juce::String& name, const char* onId, const char* amtId)
+        : label(name), onParam(*p.params.getParameter(onId)), amtParam(*p.params.getParameter(amtId)),
+          onAtt(onParam, [this](float) { repaint(); }), amtAtt(amtParam, [this](float) { repaint(); }) {
+        setMouseCursor(juce::MouseCursor::PointingHandCursor);
+    }
+    void paint(juce::Graphics& g) override {
+        const bool on = onParam.getValue() > 0.5f;
+        const float amt = amtParam.getValue();
+        auto r = getLocalBounds().toFloat();
+        auto lab = r.removeFromLeft(58);
+        g.setColour(on ? kText : kDim);
+        g.setFont(font(13.f));
+        g.drawText(label, lab, juce::Justification::centredLeft);
+        auto dot = r.removeFromRight(16).withSizeKeepingCentre(9, 9);
+        g.setColour(on ? kAccent : kFaint);
+        g.fillEllipse(dot);
+        bar = r.reduced(6, 0).withSizeKeepingCentre(r.getWidth() - 12, 3);
+        g.setColour(kLine);
+        g.fillRoundedRectangle(bar, 1.5f);
+        g.setColour(on ? kText.withAlpha(0.9f) : kFaint);
+        g.fillRoundedRectangle(bar.withWidth(bar.getWidth() * amt), 1.5f);
+        g.fillEllipse(bar.getX() + bar.getWidth() * amt - 4, bar.getCentreY() - 4, 8, 8);
+        g.setColour(kDim);
+        g.setFont(font(10.f));
+        if (on) g.drawText(juce::String((int)std::lround(amt * 100)), bar.translated(0, 6).withHeight(12), juce::Justification::centredRight);
+    }
+    void mouseDown(const juce::MouseEvent& e) override {
+        dragging = bar.expanded(0, 10).contains(e.position);
+        if (dragging) { amtAtt.beginGesture(); setAmount(e.position.x); }
+        else onAtt.setValueAsCompleteGesture(onParam.getValue() > 0.5f ? 0.f : 1.f);
+    }
+    void mouseDrag(const juce::MouseEvent& e) override { if (dragging) setAmount(e.position.x); }
+    void mouseUp(const juce::MouseEvent&) override { if (dragging) amtAtt.endGesture(); dragging = false; }
+    void mouseDoubleClick(const juce::MouseEvent&) override { onAtt.setValueAsCompleteGesture(onParam.getValue() > 0.5f ? 0.f : 1.f); }
+private:
+    void setAmount(float x) {
+        const float v = std::clamp((x - bar.getX()) / std::max(1.f, bar.getWidth()), 0.f, 1.f);
+        amtAtt.setValueAsPartOfGesture(amtParam.convertFrom0to1(v));
+        if (onParam.getValue() < 0.5f) onAtt.setValueAsCompleteGesture(1.f); // moving the amount switches it on
+    }
+    juce::String label;
+    juce::RangedAudioParameter& onParam;
+    juce::RangedAudioParameter& amtParam;
+    juce::ParameterAttachment onAtt, amtAtt;
+    juce::Rectangle<float> bar;
+    bool dragging = false;
+};
+
+// ------------------------------------------------------------------ result strip
+class LBTraEditor::ResultStrip : public juce::Component {
+public:
+    explicit ResultStrip(LBTraProcessor& p) : proc(p) {}
+    void paint(juce::Graphics& g) override {
+        auto cur = proc.current();
+        auto r = getLocalBounds().toFloat().reduced(10, 6);
+        if (!cur || cur->audio.getNumSamples() == 0) return;
+        const auto& a = cur->audio;
+        const int n = a.getNumSamples(), w = std::max(1, (int)r.getWidth());
+        const float mid = r.getCentreY(), hh = r.getHeight() * 0.5f;
+        g.setColour(kText.withAlpha(0.75f));
+        for (int x = 0; x < w; ++x) {
+            const int s0 = (int)((juce::int64)x * n / w), s1 = std::max(s0 + 1, (int)((juce::int64)(x + 1) * n / w));
+            float pk = 0;
+            for (int i = s0; i < s1 && i < n; ++i) pk = std::max(pk, std::max(std::fabs(a.getSample(0, i)), std::fabs(a.getSample(1, i))));
+            g.drawVerticalLine((int)r.getX() + x, mid - pk * hh, mid + pk * hh + 1.f);
+        }
+        const float jx = r.getX() + (float)cur->downbeat / (float)n * r.getWidth();
+        g.setColour(kAccent);
+        g.fillRect(jx - 0.75f, r.getY() - 2, 1.5f, r.getHeight() + 4);
+    }
+    void mouseDown(const juce::MouseEvent&) override { proc.auditionNow(); } // click the result to hear it
+private:
+    LBTraProcessor& proc;
+};
+
+// ------------------------------------------------------------------ "more edit"
+class LBTraEditor::MorePanel : public juce::Component {
+public:
+    explicit MorePanel(LBTraProcessor& p) : proc(p) {
+        add(rise, riseL, "rise", "Rise");
+        add(fall, fallL, "fall", "Fall");
+        add(style, styleL, "style", "Style");
+        add(finalEq, eqL, "finalEq", "Final EQ");
+        add(loopBars, barsL, "loopBars", "Loop every (bars)");
+        reverb.setButtonText("Final reverb");
+        reverbAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.params, "finalReverb", reverb);
+        addAndMakeVisible(reverb);
+        gain.setSliderStyle(juce::Slider::LinearHorizontal);
+        gain.setTextBoxStyle(juce::Slider::NoTextBox, true, 0, 0);
+        gain.setColour(juce::Slider::trackColourId, kText.withAlpha(0.8f));
+        gain.setColour(juce::Slider::backgroundColourId, kLine);
+        gain.setColour(juce::Slider::thumbColourId, kText);
+        gain.onValueChange = [this] { showGain(); };
+        gainAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(proc.params, "gain", gain);
+        showGain();
+        addAndMakeVisible(gain);
+        style1(gainL);
+        addAndMakeVisible(gainL);
+        report.setMultiLine(true);
+        report.setReadOnly(true);
+        report.setScrollbarsShown(true);
+        report.setFont(font(12.f));
+        addAndMakeVisible(report);
+    }
+    void setReport(const juce::String& s) { report.setText(s, false); }
+    void paint(juce::Graphics& g) override { g.fillAll(kBg); }
+    void resized() override {
+        auto r = getLocalBounds().reduced(16, 12);
+        auto grid = r.removeFromTop(104);
+        auto row1 = grid.removeFromTop(48), row2 = grid.withTrimmedTop(8);
+        auto cell = [](juce::Rectangle<int>& row, int w) { return row.removeFromLeft(w).reduced(6, 0); };
+        place(cell(row1, row1.getWidth() / 4), riseL, rise);
+        place(cell(row1, row1.getWidth() / 3), fallL, fall);
+        place(cell(row1, row1.getWidth() / 2), styleL, style);
+        place(cell(row1, row1.getWidth()), eqL, finalEq);
+        place(cell(row2, row2.getWidth() / 4), barsL, loopBars);
+        auto g2 = cell(row2, row2.getWidth() / 3);
+        gainL.setBounds(g2.removeFromTop(16)); gain.setBounds(g2.removeFromTop(24));
+        reverb.setBounds(cell(row2, row2.getWidth() / 2).withTrimmedTop(16).withHeight(24));
+        r.removeFromTop(10);
+        report.setBounds(r);
+    }
+private:
+    void showGain() { gainL.setText("Output  " + juce::String(gain.getValue(), 1) + " dB", juce::dontSendNotification); }
+    static void style1(juce::Label& l) { l.setColour(juce::Label::textColourId, kDim); l.setFont(font(11.f)); l.setBorderSize({0, 0, 0, 0}); }
+    void add(juce::ComboBox& b, juce::Label& l, const char* id, const char* text) {
+        if (auto* c = dynamic_cast<juce::AudioParameterChoice*>(proc.params.getParameter(id))) b.addItemList(c->choices, 1);
+        combos.push_back(std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(proc.params, id, b));
+        l.setText(text, juce::dontSendNotification);
+        style1(l);
+        addAndMakeVisible(b);
+        addAndMakeVisible(l);
+    }
+    static void place(juce::Rectangle<int> c, juce::Label& l, juce::Component& b) { l.setBounds(c.removeFromTop(16)); b.setBounds(c.removeFromTop(26)); }
+    LBTraProcessor& proc;
+    juce::ComboBox rise, fall, style, finalEq, loopBars;
+    juce::Label riseL, fallL, styleL, eqL, barsL, gainL;
+    juce::ToggleButton reverb;
+    juce::Slider gain;
+    juce::TextEditor report;
+    std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> combos;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> reverbAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> gainAtt;
+};
+
+class LBTraEditor::MoreButton : public juce::Component {
+public:
+    std::function<void()> onClick;
+    bool open = false;
+    MoreButton() { setMouseCursor(juce::MouseCursor::PointingHandCursor); setTooltip("More edit"); }
+    void setTooltip(const juce::String&) {}
+    void paint(juce::Graphics& g) override {
+        // three short sliders: an "edit" glyph; filled when the panel is open
+        auto r = getLocalBounds().toFloat().withSizeKeepingCentre(18, 14);
+        g.setColour(open ? kAccent : (over ? kText : kDim));
+        const float xs[3] = {0.3f, 0.7f, 0.45f};
+        for (int k = 0; k < 3; ++k) {
+            const float y = r.getY() + r.getHeight() * (float)k / 2.f;
+            g.drawLine(r.getX(), y, r.getRight(), y, 1.2f);
+            g.fillEllipse(r.getX() + r.getWidth() * xs[k] - 2.5f, y - 2.5f, 5, 5);
+        }
+    }
+    void mouseEnter(const juce::MouseEvent&) override { over = true; repaint(); }
+    void mouseExit(const juce::MouseEvent&) override { over = false; repaint(); }
+    void mouseUp(const juce::MouseEvent&) override { if (onClick) onClick(); }
+private:
+    bool over = false;
+};
 
 // ------------------------------------------------------------------ editor
 LBTraEditor::LBTraEditor(LBTraProcessor& p) : AudioProcessorEditor(p), proc(p) {
+    setLookAndFeel(&look);
     for (int i = 0; i < LBTraProcessor::kSlots; ++i) {
-        slots.push_back(std::make_unique<SlotView>(*this, i));
-        addAndMakeVisible(*slots.back());
+        rows.push_back(std::make_unique<SampleRow>(*this, i));
+        addAndMakeVisible(*rows.back());
+        rows.back()->refresh();
     }
-    addAndMakeVisible(wave);
-    title.setText("LBTra", juce::dontSendNotification);
-    title.setFont(juce::FontOptions(22.f, juce::Font::bold));
-    title.setColour(juce::Label::textColourId, kText);
-    addAndMakeVisible(title);
-
-    dice.setButtonText(u8("摇骰子"));
-    dice.setColour(juce::TextButton::buttonColourId, kAccent);
-    dice.setColour(juce::TextButton::textColourOffId, juce::Colours::black);
-    dice.onClick = [this] { proc.rollDice(); };
-    addAndMakeVisible(dice);
-    audition.setButtonText(u8("试听"));
-    audition.onClick = [this] { proc.auditionNow(); };
-    addAndMakeVisible(audition);
-
-    addCombo(rise, riseL, "rise", "上升");
-    addCombo(fall, fallL, "fall", "下降");
-    addCombo(style, styleL, "style", "风格");
-    addCombo(finalEq, finalEqL, "finalEq", "最终 EQ");
-    addCombo(mode, modeL, "mode", "模式");
-    addCombo(loopBars, loopBarsL, "loopBars", "Loop 每几小节");
-
-    for (auto* s : {&comp, &gain}) {
-        s->setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-        s->setTextBoxStyle(juce::Slider::TextBoxBelow, false, 64, 18);
-        s->setColour(juce::Slider::rotarySliderFillColourId, kAccent);
-        addAndMakeVisible(*s);
+    dice = std::make_unique<Dice>(*this);
+    addAndMakeVisible(*dice);
+    modeSwitch = std::make_unique<ModeSwitch>(proc);
+    addAndMakeVisible(*modeSwitch);
+    const char* names[5][3] = {{"Gate", "gateOn", "gate"}, {"Comp", "compOn", "comp"}, {"Wide", "wideOn", "wide"}, {"Bass", "bassOn", "bass"}, {"Shape", "shapeOn", "shape"}};
+    for (auto& n : names) {
+        switches.push_back(std::make_unique<SwitchRow>(proc, n[0], n[1], n[2]));
+        addAndMakeVisible(*switches.back());
     }
-    comp.textFromValueFunction = [](double v) { return juce::String((int)std::lround(v * 100)) + "%"; };
-    gain.textFromValueFunction = [](double v) { return juce::String(v, 1) + " dB"; };
-    compAtt = std::make_unique<SliderAttachment>(proc.params, "comp", comp);
-    gainAtt = std::make_unique<SliderAttachment>(proc.params, "gain", gain);
-    for (auto [l, t] : {std::pair{&compL, "压缩量"}, std::pair{&gainL, "输出音量"}}) {
-        l->setText(u8(t), juce::dontSendNotification);
-        l->setJustificationType(juce::Justification::centred);
-        l->setColour(juce::Label::textColourId, kDim);
-        addAndMakeVisible(*l);
-    }
-    finalReverb.setButtonText(u8("最终混响"));
-    finalReverb.setColour(juce::ToggleButton::textColourId, kText);
-    reverbAtt = std::make_unique<ButtonAttachment>(proc.params, "finalReverb", finalReverb);
-    addAndMakeVisible(finalReverb);
-
-    status.setColour(juce::Label::textColourId, kDim);
-    addAndMakeVisible(status);
-    report.setMultiLine(true);
-    report.setReadOnly(true);
-    report.setScrollbarsShown(true);
-    report.setColour(juce::TextEditor::backgroundColourId, kPanel);
-    report.setColour(juce::TextEditor::textColourId, kDim);
-    report.setColour(juce::TextEditor::outlineColourId, kLine);
-    report.setFont(juce::FontOptions(12.f));
-    addAndMakeVisible(report);
+    strip = std::make_unique<ResultStrip>(proc);
+    addAndMakeVisible(*strip);
+    more = std::make_unique<MorePanel>(proc);
+    addChildComponent(*more);
+    moreButton = std::make_unique<MoreButton>();
+    moreButton->onClick = [this] {
+        more->setVisible(!more->isVisible());
+        moreButton->open = more->isVisible();
+        moreButton->repaint();
+    };
+    addAndMakeVisible(*moreButton);
 
     proc.renderDone.addChangeListener(this);
     changeListenerCallback(nullptr);
     setResizable(true, true);
-    setResizeLimits(820, 560, 1600, 1100);
-    setSize(980, 640);
-    startTimerHz(5);
+    setResizeLimits(640, 400, 1400, 880);
+    if (auto* c = getConstrainer()) c->setFixedAspectRatio(760.0 / 460.0);
+    setSize(760, 460);
+    startTimerHz(10);
 }
 
-LBTraEditor::~LBTraEditor() { proc.renderDone.removeChangeListener(this); }
-
-void LBTraEditor::addCombo(juce::ComboBox& box, juce::Label& label, const char* id, const char* text) {
-    auto* param = dynamic_cast<juce::AudioParameterChoice*>(proc.params.getParameter(id));
-    if (param) box.addItemList(param->choices, 1);
-    comboAtt.push_back(std::make_unique<ComboAttachment>(proc.params, id, box));
-    label.setText(u8(text), juce::dontSendNotification);
-    label.setColour(juce::Label::textColourId, kDim);
-    addAndMakeVisible(box);
-    addAndMakeVisible(label);
+LBTraEditor::~LBTraEditor() {
+    proc.renderDone.removeChangeListener(this);
+    setLookAndFeel(nullptr);
 }
 
 void LBTraEditor::loadInto(int index, const juce::File& f) {
     juce::String err;
-    if (!proc.loadSlot(index, f, err)) status.setText(err, juce::dontSendNotification);
-    slots[(size_t)index]->repaint();
+    if (!proc.loadSlot(index, f, err)) { message = err; messageTicks = 40; }
+    rows[(size_t)index]->refresh();
+    repaint();
+}
+
+juce::String LBTraEditor::resultName() const {
+    auto cur = proc.current();
+    if (!cur) return "LBTra";
+    return "LB-" + juce::String::toHexString((juce::int64)(cur->seed & 0xFFFFFF)).toUpperCase().paddedLeft('0', 6);
 }
 
 void LBTraEditor::changeListenerCallback(juce::ChangeBroadcaster*) {
     auto cur = proc.current();
-    report.setText(cur ? cur->report : juce::String(), false);
-    wave.repaint();
-    for (auto& s : slots) s->repaint();
+    more->setReport(cur ? cur->report : juce::String());
+    strip->repaint();
+    for (auto& r : rows) r->refresh();
+    repaint();
 }
 
 void LBTraEditor::timerCallback() {
-    juce::String s = proc.isRendering() ? u8("正在渲染……") : u8("就绪");
-    s += u8("   宿主速度 ") + juce::String(proc.hostBpm(), 1) + " BPM";
-    if ((int)*proc.params.getRawParameterValue("mode") == 0) s += u8("   Play：MIDI 音符触发，从上升开头播放");
-    else s += u8("   Loop：走带时自动触发，衔接点落在小节线上");
-    status.setText(s, juce::dontSendNotification);
+    if (messageTicks > 0 && --messageTicks == 0) { message.clear(); repaint(); }
+    dice->repaint();
+    static bool wasRendering = false;
+    if (wasRendering != proc.isRendering()) { wasRendering = proc.isRendering(); repaint(); }
 }
 
-void LBTraEditor::paint(juce::Graphics& g) { g.fillAll(kBg); }
+void LBTraEditor::paint(juce::Graphics& g) {
+    g.fillAll(kBg);
+    const float k = (float)getWidth() / 760.f;
+    const int top = (int)(46 * k), rightW = (int)(190 * k);
+    g.setColour(kLine);
+    g.drawLine(0.f, (float)top - 0.5f, (float)getWidth(), (float)top - 0.5f, 1.f);
+    g.drawLine((float)(getWidth() - rightW) + 0.5f, (float)top, (float)(getWidth() - rightW) + 0.5f, (float)getHeight(), 1.f);
+    // name bar
+    auto bar = juce::Rectangle<int>(0, 0, getWidth() - rightW, top).reduced((int)(18 * k), 0);
+    g.setColour(kText);
+    g.setFont(font(17.f * k, true));
+    g.drawText(resultName(), bar, juce::Justification::centredLeft);
+    g.setFont(font(11.f * k));
+    g.setColour(message.isNotEmpty() ? kAccent : kDim);
+    juce::String info = message;
+    if (info.isEmpty()) {
+        if (proc.isRendering()) info = "rendering...";
+        else if (auto cur = proc.current())
+            info = juce::String(cur->bpm, 1) + " BPM  ·  rise " + juce::StringArray{"1/8", "1/4", "1/2", "1 bar", "2 bar"}[juce::jlimit(0, 4, (int)std::round(std::log2(cur->riseBeats * 2.f)))] +
+                   "  ·  fall " + juce::StringArray{"1/8", "1/4", "1/2", "1 bar", "2 bar"}[juce::jlimit(0, 4, (int)std::round(std::log2(cur->fallBeats * 2.f)))];
+        else info = "drop up to 5 samples, then roll";
+    }
+    g.drawText(info, bar.withTrimmedRight((int)(40 * k)), juce::Justification::centredRight);
+    auto brand = juce::Rectangle<int>(getWidth() - rightW, 0, rightW, top).reduced((int)(16 * k), 0);
+    g.setColour(kFaint);
+    g.setFont(font(11.f * k, true));
+    g.drawText("LBTRA", brand, juce::Justification::centredRight);
+}
 
 void LBTraEditor::resized() {
-    auto r = getLocalBounds().reduced(14);
-    auto top = r.removeFromTop(34);
-    title.setBounds(top.removeFromLeft(120));
-    dice.setBounds(top.removeFromRight(130).reduced(2));
-    top.removeFromRight(8);
-    audition.setBounds(top.removeFromRight(90).reduced(2));
-    r.removeFromTop(8);
-    auto slotRow = r.removeFromTop(130);
-    const int sw = slotRow.getWidth() / LBTraProcessor::kSlots;
-    for (auto& s : slots) s->setBounds(slotRow.removeFromLeft(sw).reduced(3, 0));
-    r.removeFromTop(10);
-    wave.setBounds(r.removeFromTop(120));
-    r.removeFromTop(10);
-    auto controls = r.removeFromTop(92);
-    auto knobs = controls.removeFromRight(200);
-    auto k1 = knobs.removeFromLeft(100), k2 = knobs;
-    compL.setBounds(k1.removeFromTop(18)); comp.setBounds(k1);
-    gainL.setBounds(k2.removeFromTop(18)); gain.setBounds(k2);
-    auto row1 = controls.removeFromTop(46), row2 = controls;
-    auto place = [](juce::Rectangle<int>& row, juce::Label& l, juce::Component& c, int w) {
-        auto cell = row.removeFromLeft(w).reduced(4, 2);
-        l.setBounds(cell.removeFromTop(16));
-        c.setBounds(cell);
-    };
-    place(row1, riseL, rise, 110); place(row1, fallL, fall, 110); place(row1, styleL, style, 110); place(row1, finalEqL, finalEq, 110);
-    place(row2, modeL, mode, 110); place(row2, loopBarsL, loopBars, 130);
-    finalReverb.setBounds(row2.removeFromLeft(130).reduced(4, 10).withTrimmedTop(10));
-    r.removeFromTop(6);
-    status.setBounds(r.removeFromBottom(22));
-    report.setBounds(r);
+    const float k = (float)getWidth() / 760.f;
+    const int top = (int)(46 * k), rightW = (int)(190 * k);
+    auto area = getLocalBounds();
+    area.removeFromTop(top);
+    auto right = area.removeFromRight(rightW).reduced((int)(18 * k), (int)(16 * k));
+    auto left = area;
+    moreButton->setBounds(getWidth() - rightW - (int)(40 * k), 0, (int)(36 * k), top);
+
+    auto stripArea = left.removeFromBottom((int)(54 * k));
+    strip->setBounds(stripArea);
+    const int rowH = left.getHeight() / LBTraProcessor::kSlots;
+    for (auto& r : rows) r->setBounds(left.removeFromTop(rowH));
+    more->setBounds(getLocalBounds().withTrimmedTop(top).withTrimmedRight(rightW + 1));
+
+    dice->setBounds(right.removeFromTop((int)(78 * k)).withSizeKeepingCentre((int)(72 * k), (int)(72 * k)));
+    right.removeFromTop((int)(12 * k));
+    modeSwitch->setBounds(right.removeFromTop((int)(26 * k)));
+    right.removeFromTop((int)(14 * k));
+    const int sh = right.getHeight() / (int)switches.size();
+    for (auto& s : switches) s->setBounds(right.removeFromTop(sh));
 }

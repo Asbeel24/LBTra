@@ -436,6 +436,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (t.role == Role::Roll) chosen.push_back(FxType::Stutter);
         const int count = req.arrangeOnly ? 0 : std::min(kMaxFxPerTrack, (int)chosen.size() + 1 + rng.weighted({0.3f, 0.4f, 0.3f}));
         auto w = fxWeights(a, req.style, t.role);
+        w[(size_t)FxType::Shaper] = 2.5f * std::clamp(req.shaperAmount, 0.f, 1.f);
         while ((int)chosen.size() < count) {
             for (FxType c : chosen) w[(size_t)c] = 0.f;
             float sum = 0;
@@ -620,7 +621,15 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
 
     // ---- output options
     OutputOptions out;
-    if (req.forcedOutput) out = *req.forcedOutput;
+    if (req.forcedOutput) {
+        out = *req.forcedOutput;
+        if (out.gate && out.gatePattern == 0xFFFFu) { // gate switched on by the user: the dice still pick the pattern
+            out.gateStepBeats = rng.pick<float>({0.25f, 0.125f});
+            const float dens = rng.range(0.5f, 0.8f);
+            out.gatePattern = 1u;
+            for (int k = 1; k < 16; ++k) if (rng.chance(dens)) out.gatePattern |= 1u << k;
+        }
+    }
     else {
         const float gp = req.style == Style::Dirty || req.style == Style::Fragment ? 0.6f : (req.style == Style::Ambient ? 0.15f : 0.3f);
         out.gate = rng.chance(gp) && false; // gate comes back later as a user toggle (user 11/4)

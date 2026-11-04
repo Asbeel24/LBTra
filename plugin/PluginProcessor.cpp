@@ -24,10 +24,20 @@ juce::AudioProcessorValueTreeState::ParameterLayout LBTraProcessor::layout() {
     l.add(std::make_unique<AudioParameterChoice>(ParameterID{"rise", 1}, u8("上升长度"), beatNames(), 3));
     l.add(std::make_unique<AudioParameterChoice>(ParameterID{"fall", 1}, u8("下降长度"), beatNames(), 2));
     l.add(std::make_unique<AudioParameterChoice>(ParameterID{"style", 1}, u8("风格"), StringArray{u8("标准"), u8("脏"), u8("氛围"), u8("碎片")}, 0));
+    // right column: each processor has an on/off switch and an amount
+    l.add(std::make_unique<AudioParameterBool>(ParameterID{"gateOn", 1}, "Gate", false));
+    l.add(std::make_unique<AudioParameterFloat>(ParameterID{"gate", 1}, "Gate Amount", NormalisableRange<float>(0.f, 1.f), 0.8f));
+    l.add(std::make_unique<AudioParameterBool>(ParameterID{"compOn", 1}, "Comp", true));
     l.add(std::make_unique<AudioParameterFloat>(ParameterID{"comp", 1}, u8("压缩量"), NormalisableRange<float>(0.f, 1.f), 0.65f));
+    l.add(std::make_unique<AudioParameterBool>(ParameterID{"wideOn", 1}, "Wide", false));
+    l.add(std::make_unique<AudioParameterFloat>(ParameterID{"wide", 1}, "Wide Amount", NormalisableRange<float>(0.f, 1.f), 0.5f));
+    l.add(std::make_unique<AudioParameterBool>(ParameterID{"bassOn", 1}, "Bass", false));
+    l.add(std::make_unique<AudioParameterFloat>(ParameterID{"bass", 1}, "Bass Amount", NormalisableRange<float>(0.f, 1.f), 0.5f));
+    l.add(std::make_unique<AudioParameterBool>(ParameterID{"shapeOn", 1}, "Shape", false));
+    l.add(std::make_unique<AudioParameterFloat>(ParameterID{"shape", 1}, "Shape Amount", NormalisableRange<float>(0.f, 1.f), 0.5f));
     l.add(std::make_unique<AudioParameterBool>(ParameterID{"finalReverb", 1}, u8("最终混响"), false));
     l.add(std::make_unique<AudioParameterChoice>(ParameterID{"finalEq", 1}, u8("最终 EQ"), StringArray{u8("关"), u8("电话"), u8("变暗")}, 0));
-    l.add(std::make_unique<AudioParameterChoice>(ParameterID{"mode", 1}, u8("模式"), StringArray{"Play", "Loop"}, 0));
+    l.add(std::make_unique<AudioParameterChoice>(ParameterID{"mode", 1}, u8("模式"), StringArray{"Inst", "Loop"}, 0));
     l.add(std::make_unique<AudioParameterChoice>(ParameterID{"loopBars", 1}, u8("每几小节"), StringArray{"1", "2", "4", "8"}, 2));
     l.add(std::make_unique<AudioParameterFloat>(ParameterID{"gain", 1}, u8("输出音量"), NormalisableRange<float>(-24.f, 6.f), 0.f));
     return l;
@@ -37,7 +47,7 @@ LBTraProcessor::LBTraProcessor()
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       params(*this, nullptr, "LBTra", layout()) {
     formats.registerBasicFormats();
-    for (auto id : {"rise", "fall", "style", "comp", "finalReverb", "finalEq"}) params.addParameterListener(id, this);
+    for (auto id : {"rise", "fall", "style", "comp", "finalReverb", "finalEq", "gateOn", "gate", "compOn", "wideOn", "wide", "bassOn", "bass", "shapeOn", "shape"}) params.addParameterListener(id, this);
     startTimer(150);
 }
 
@@ -110,9 +120,15 @@ void LBTraProcessor::startRender() {
     req.lengthBeats = kBeatChoices[(int)*params.getRawParameterValue("rise")];
     req.fallBeats = kBeatChoices[(int)*params.getRawParameterValue("fall")];
     req.bpm = (float)lastBpm.load();
-    req.compAmount = *params.getRawParameterValue("comp");
-    lb::OutputOptions out; // the trance gate stays off for now; it comes back later as a toggle
-    out.gate = false;
+    auto on = [this](const char* id) { return *params.getRawParameterValue(id) > 0.5f; };
+    auto val = [this](const char* id) { return params.getRawParameterValue(id)->load(); };
+    req.compAmount = on("compOn") ? val("comp") : 0.f;
+    req.shaperAmount = on("shapeOn") ? val("shape") : 0.f;
+    lb::OutputOptions out;
+    out.gate = on("gateOn");
+    out.gateDepth = val("gate");
+    out.wide = on("wideOn") ? val("wide") : 0.f;
+    out.bass = on("bassOn") ? val("bass") : 0.f;
     out.finalReverb = *params.getRawParameterValue("finalReverb") > 0.5f;
     out.finalEq = (lb::OutputOptions::EqMode)(int)*params.getRawParameterValue("finalEq");
     req.forcedOutput = out;

@@ -25,6 +25,7 @@ struct RenderRequest {
     // fallBeats > 0 fixes the file to exactly rise + fall; 0 keeps the free tail.
     float fallBeats = 0.f;
     std::optional<float> compAmount; // 0..1 bus compression; empty = dice
+    float shaperAmount = 0.f;        // 0..1: how likely the tempo-synced shaper effect is (0 = never)
 };
 
 struct RenderResult {
