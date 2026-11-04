@@ -61,7 +61,7 @@ Role pickRole(const Analysis& a, Rng& r, bool arrangeOnly) {
 
 std::vector<float> fxWeights(const Analysis& a, Style st, Role role) {
     //               Reverb RevRev Delay  Eq   Dist Crystal Stutter Gran Shaper GrainDly Chroma
-    std::vector<float> w{0.9f, 0.6f, 1.0f, 0.8f, 0.6f, 1.0f, 0.5f, 0.6f, 0.0f, 1.1f, 0.9f}; // Shaper off (user 11/4)
+    std::vector<float> w{1.0f, 0.6f, 1.0f, 1.2f, 0.6f, 1.0f, 0.5f, 1.0f, 0.0f, 1.2f, 0.9f}; // Shaper off (user 11/4)
     auto mul = [&](FxType t, float m) { w[(size_t)t] *= m; };
     switch (st) {
     case Style::Dirty: mul(FxType::Distortion, 3.f); mul(FxType::Stutter, 1.5f); mul(FxType::Shaper, 1.5f); mul(FxType::Reverb, 0.5f); mul(FxType::ReverseReverb, 0.5f); break;

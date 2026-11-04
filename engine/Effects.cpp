@@ -76,9 +76,9 @@ public:
     float decay, damp, mix, width, wetHp;
     int predelayMs;
     Reverb(Rng& r, const FxLimits& lim) {
-        decay = r.logRange(0.3f, std::max(0.31f, lim.maxReverbSec));
-        damp = r.range(0.15f, 0.6f);
-        mix = r.range(0.1f, 0.6f);
+        decay = r.logRange(std::min(1.2f, lim.maxReverbSec * 0.5f), std::max(1.21f, lim.maxReverbSec));
+        damp = r.range(0.1f, 0.5f);
+        mix = r.range(0.35f, 0.85f);
         width = r.range(0.6f, 1.f);
         predelayMs = r.irange(0, 40);
         wetHp = lim.lowRegister ? r.range(250.f, 500.f) : r.range(80.f, 300.f);
@@ -131,8 +131,8 @@ public:
         mode = (Mode)r.weighted({1.2f, 1.f, 0.7f, 0.8f});
         beatsL = r.pick<float>({0.25f, 0.5f, 0.75f, 1.f / 3.f, 1.f, 0.125f});
         beatsR = r.chance(0.4f) ? r.pick<float>({0.25f, 0.5f, 0.75f, 1.f / 3.f, 0.375f}) : beatsL;
-        fb = mode == Dub ? r.range(0.6f, 0.92f) : r.range(0.3f, 0.8f);
-        mix = r.range(0.3f, 0.7f);
+        fb = mode == Dub ? r.range(0.7f, 0.94f) : r.range(0.5f, 0.88f);
+        mix = r.range(0.45f, 0.85f);
         lpHz = mode == Tape ? r.logRange(1800.f, 6000.f) : r.logRange(3000.f, 12000.f);
         hpHz = lim.lowRegister ? r.logRange(200.f, 500.f) : r.logRange(100.f, 700.f);
         wowDepthMs = mode == Tape ? r.range(0.6f, 3.5f) : mode == Diffuse ? r.range(0.2f, 1.f) : 0.f;
@@ -211,18 +211,18 @@ public:
 // set), length, direction and pan. With feedback the pitched grains climb or fall in a spiral.
 class GrainDelay : public Effect {
 public:
-    float beats, fb, mix, density, jitterBeats, reverseProb, grainMs;
+    float delayMs, fb, mix, density, jitterMs, reverseProb, grainMs;
     std::vector<float> pitches;
     bool synced;
     uint64_t seed;
     GrainDelay(Rng& r, const FxLimits& lim) {
-        beats = r.pick<float>({0.25f, 0.5f, 0.75f, 1.f, 1.f / 3.f});
-        fb = r.range(0.2f, 0.75f);
-        mix = r.range(0.35f, 0.8f);
-        density = r.range(12.f, 45.f);
-        jitterBeats = r.range(0.f, 0.25f);
-        reverseProb = r.range(0.f, 0.5f);
-        grainMs = r.range(35.f, 180.f);
+        delayMs = r.logRange(60.f, 700.f); // free time, not on the beat grid (user 11/4)
+        fb = r.range(0.45f, 0.85f);
+        mix = r.range(0.55f, 0.95f);
+        density = r.range(20.f, 90.f);
+        jitterMs = r.range(0.f, 250.f);
+        reverseProb = r.range(0.1f, 0.7f);
+        grainMs = r.range(50.f, 320.f);
         synced = r.chance(0.4f) && false; // rhythmic grain mode off (user 11/4)
         if (lim.allowPitch) pitches = r.pick<std::vector<float>>({{12.f}, {12.f, 0.f}, {7.f, 12.f}, {-12.f, 0.f}, {12.f, 19.f, 24.f}, {0.f, 5.f, 12.f}, {-5.f, 7.f}, {0.f, 0.1f, -0.1f}});
         else pitches = {0.f, 0.f, 12.f};
@@ -232,7 +232,7 @@ public:
         const int n = b.size();
         const float sr = (float)b.sr;
         Rng r(seed);
-        const int d = std::max(1, t.beats(beats));
+        const int d = std::max(1, (int)(delayMs * 0.001f * sr));
         std::vector<float> lineL((size_t)n, 0.f), lineR((size_t)n, 0.f), outL((size_t)n, 0.f), outR((size_t)n, 0.f);
         struct Grain { double pos; float ratio; int len, age; bool rev; float gl, gr; };
         std::vector<Grain> active;
@@ -247,7 +247,7 @@ public:
                 g.rev = r.chance(reverseProb);
                 // read window [start, start + len*ratio] must already be written (< i)
                 const double span = (double)g.len * (double)g.ratio;
-                double start = (double)i - (double)d - r.uni() * (double)t.beats(jitterBeats);
+                double start = (double)i - (double)d - r.uni() * (double)(jitterMs * 0.001f * sr);
                 start = std::min(start, (double)i - span - 2.0);
                 g.pos = std::max(0.0, start);
                 g.age = 0;
@@ -278,21 +278,24 @@ public:
     std::string describe() const override {
         std::string p;
         for (float v : pitches) p += (p.empty() ? "" : "/") + fmt("%+g", std::round(v * 10) / 10);
-        return fmt("颗粒延迟（%s，反馈 %d%%，湿 %d%%，%s，颗粒 %.0fms，音高 %s，倒放 %d%%，抖动 %.2f 拍）", beatsName(beats).c_str(), (int)(fb * 100),
-                   (int)(mix * 100), synced ? "颗粒按 1/16 拍子出" : fmt("%.0f 粒/秒", density).c_str(), grainMs, p.c_str(), (int)(reverseProb * 100), jitterBeats);
+        return fmt("颗粒延迟（%.0fms，反馈 %d%%，湿 %d%%，%.0f 粒/秒，颗粒 %.0fms，音高 %s，倒放 %d%%，抖动 %.0fms）", delayMs, (int)(fb * 100),
+                   (int)(mix * 100), density, grainMs, p.c_str(), (int)(reverseProb * 100), jitterMs);
     }
 };
 
 // ------------------------------------------------------------------ EQ / filter sweep
 class Eq : public Effect {
 public:
-    bool sweep;
+    enum Mode { Static, Sweep, ShelfOpen } mode;
     Biquad::Type type = Biquad::LP;
     float f0 = 0, f1 = 0, q = 0.707f;
     float lowDb = 0, midDb = 0, midHz = 1000, highDb = 0;
+    // ShelfOpen: shelf gains travel from *From to *To on the way into the junction
+    float lowFrom = 0, lowTo = 0, highFrom = 0, highTo = 0, lowHz = 150, highHz = 6000, curve = 1.5f;
+    bool snapBack = false;
     Eq(Rng& r, const FxLimits& lim) {
-        sweep = r.chance(0.6f);
-        if (sweep) {
+        mode = (Mode)r.weighted({0.05f, 0.2f, 0.75f});
+        if (mode == Sweep) {
             const int k = r.irange(0, 2);
             type = k == 0 ? Biquad::LP : (k == 1 ? Biquad::HP : Biquad::BP);
             const bool up = r.chance(0.7f);
@@ -301,6 +304,14 @@ public:
             f0 = up ? lo * r.range(1.f, 1.5f) : hi * r.range(0.6f, 1.f);
             f1 = up ? hi * r.range(0.6f, 1.f) : lo * r.range(1.f, 1.5f);
             q = r.range(0.7f, type == Biquad::BP ? 4.f : 6.f);
+        } else if (mode == ShelfOpen) {
+            // which shelves move: low, high or both; they open up (cut -> boost) into the junction
+            const int which = r.weighted({1.f, 1.f, 1.5f}); // 0 low, 1 high, 2 both
+            if (which != 1) { lowFrom = -r.range(8.f, 18.f); lowTo = r.range(2.f, lim.lowRegister ? 5.f : 9.f); lowHz = r.logRange(90.f, 250.f); }
+            if (which != 0) { highFrom = -r.range(8.f, 20.f); highTo = r.range(2.f, 10.f); highHz = r.logRange(3000.f, 9000.f); }
+            curve = r.range(0.8f, 2.5f);
+            snapBack = r.chance(0.35f);
+            if (r.chance(0.4f)) { midHz = r.logRange(400.f, 3000.f); midDb = r.range(4.f, 10.f); q = r.range(1.f, 4.f); }
         } else {
             const float mag = r.range(3.f, 9.f);
             lowDb = r.range(-mag, mag) * (lim.lowRegister ? 0.5f : 1.f);
@@ -310,15 +321,40 @@ public:
             q = r.range(0.5f, 2.f);
         }
     }
-    void process(Buffer& b, const Timeline&, const Region& r) override {
-        if (!sweep) {
+    void process(Buffer& b, const Timeline& tl, const Region& r) override {
+        const float sr = (float)b.sr;
+        if (mode == Static) {
             Biquad s[2][3];
             for (auto& ch : s) {
-                ch[0].set(Biquad::LowShelf, 150.f, 0.707f, lowDb, (float)b.sr);
-                ch[1].set(Biquad::Peak, midHz, q, midDb, (float)b.sr);
-                ch[2].set(Biquad::HighShelf, 7000.f, 0.707f, highDb, (float)b.sr);
+                ch[0].set(Biquad::LowShelf, 150.f, 0.707f, lowDb, sr);
+                ch[1].set(Biquad::Peak, midHz, q, midDb, sr);
+                ch[2].set(Biquad::HighShelf, 7000.f, 0.707f, highDb, sr);
             }
             for (int i = 0; i < b.size(); ++i) {
+                b.L[(size_t)i] = s[0][2].process(s[0][1].process(s[0][0].process(b.L[(size_t)i])));
+                b.R[(size_t)i] = s[1][2].process(s[1][1].process(s[1][0].process(b.R[(size_t)i])));
+            }
+            return;
+        }
+        if (mode == ShelfOpen) {
+            Biquad s[2][3];
+            const int a = std::min(r.start, std::max(0, tl.downbeat - 1));
+            const int j = std::max(a + 1, tl.downbeat);
+            const int back = tl.beat() / 2;
+            for (int i = 0; i < b.size(); ++i) {
+                if ((i & 31) == 0) {
+                    float p = std::pow(std::clamp((float)(i - a) / (float)(j - a), 0.f, 1.f), curve);
+                    if (snapBack && i > j) p = std::max(0.f, 1.f - (float)(i - j) / (float)back); // falls back to closed after the hit
+                    const float lg = lowFrom + (lowTo - lowFrom) * p, hg = highFrom + (highTo - highFrom) * p, mg = midDb * p;
+                    for (auto& ch : s) {
+                        Biquad n0, n1, n2;
+                        n0.set(Biquad::LowShelf, lowHz, 0.707f, lg, sr);
+                        n1.set(Biquad::Peak, midHz, q, mg, sr);
+                        n2.set(Biquad::HighShelf, highHz, 0.707f, hg, sr);
+                        Biquad* nn[3] = {&n0, &n1, &n2};
+                        for (int k = 0; k < 3; ++k) { nn[k]->z1 = ch[k].z1; nn[k]->z2 = ch[k].z2; ch[k] = *nn[k]; }
+                    }
+                }
                 b.L[(size_t)i] = s[0][2].process(s[0][1].process(s[0][0].process(b.L[(size_t)i])));
                 b.R[(size_t)i] = s[1][2].process(s[1][1].process(s[1][0].process(b.R[(size_t)i])));
             }
@@ -330,7 +366,7 @@ public:
             if ((i & 31) == 0) {
                 const float t = std::clamp((float)(i - a) / (float)(e - a), 0.f, 1.f);
                 const float f = f0 * std::pow(f1 / f0, t);
-                l.set(type, f, q, 0, (float)b.sr);
+                l.set(type, f, q, 0, sr);
                 rr.b0 = l.b0; rr.b1 = l.b1; rr.b2 = l.b2; rr.a1 = l.a1; rr.a2 = l.a2;
             }
             float gl = l.process(b.L[(size_t)i]), gr = rr.process(b.R[(size_t)i]);
@@ -340,7 +376,16 @@ public:
         }
     }
     std::string describe() const override {
-        if (!sweep) return fmt("EQ（低架 %+.1fdB，%.0fHz %+.1fdB，高架 %+.1fdB）", lowDb, midHz, midDb, highDb);
+        if (mode == Static) return fmt("EQ（低架 %+.1fdB，%.0fHz %+.1fdB，高架 %+.1fdB）", lowDb, midHz, midDb, highDb);
+        if (mode == ShelfOpen) {
+            std::string s = "EQ 包络（";
+            if (lowFrom != 0) s += fmt("低架 %.0fHz 从 %+.0fdB 打开到 %+.0fdB", lowHz, lowFrom, lowTo);
+            if (highFrom != 0) s += std::string(lowFrom != 0 ? "，" : "") + fmt("高架 %.0fHz 从 %+.0fdB 打开到 %+.0fdB", highHz, highFrom, highTo);
+            if (midDb != 0) s += fmt("，%.0fHz 峰值逐渐 %+.0fdB", midHz, midDb);
+            s += fmt("，曲线 %.1f", curve);
+            if (snapBack) s += "，强拍后半拍内收回";
+            return s + "）";
+        }
         const char* n = type == Biquad::LP ? "低通" : (type == Biquad::HP ? "高通" : "带通");
         return fmt("%s扫频（%.0fHz → %.0fHz，Q %.1f）", n, f0, f1, q);
     }
@@ -610,19 +655,19 @@ public:
 // ------------------------------------------------------------------ Granular cloud
 class Granular : public Effect {
 public:
-    float density, sprayBeats, reverseProb, mix;
+    float density, spraySec, reverseProb, mix;
     int grainMs;
     bool freeze, synced = false;
     float stepBeats = 0.25f;
     std::vector<float> pitches;
     uint64_t seed;
     Granular(Rng& r, const FxLimits& lim) {
-        density = r.range(15.f, 80.f);
-        grainMs = r.irange(20, 160);
-        sprayBeats = r.range(0.f, 0.5f);
-        reverseProb = r.range(0.f, 0.6f);
-        mix = r.range(0.3f, 0.9f);
-        freeze = r.chance(0.3f);
+        density = r.range(30.f, 140.f);
+        grainMs = r.irange(40, 400);
+        spraySec = r.range(0.05f, 0.8f);
+        reverseProb = r.range(0.1f, 0.8f);
+        mix = r.range(0.6f, 1.f);
+        freeze = r.chance(0.35f);
         pitches = lim.allowPitch ? std::vector<float>{0.f, 12.f, -12.f, 7.f} : std::vector<float>{0.f};
         if (lim.allowPitch && r.chance(0.5f)) pitches = r.pick<std::vector<float>>({{0.f, 12.f}, {0.f, 3.f, 7.f, 12.f}, {0.f, 7.f, 12.f, 19.f}, {-12.f, 0.f, 5.f}});
         synced = r.chance(0.4f) && false; // rhythmic grain mode off (user 11/4)
@@ -633,7 +678,7 @@ public:
         Rng r(seed);
         Buffer out(b.size(), b.sr);
         const int g = grainMs * b.sr / 1000;
-        const int spray = t.beats(sprayBeats);
+        const int spray = (int)(spraySec * (float)b.sr);
         int a = reg.start, e = reg.end;
         int frozen = reg.start;
         if (freeze) {
@@ -679,10 +724,10 @@ public:
     std::string describe() const override {
         std::string p;
         for (float v : pitches) p += (p.empty() ? "" : "/") + fmt("%+d", (int)v);
-        if (synced) return fmt("节奏粒子重组（%s每 %s 一粒，颗粒 %dms，散布 %.2f 拍，倒放 %d%%，音高 %s，湿 %d%%）", freeze ? "冻结，" : "", beatsName(stepBeats).c_str(),
-                               grainMs, sprayBeats, (int)(reverseProb * 100), p.c_str(), (int)(mix * 100));
-        return fmt("粒子云（%s密度 %.0f 粒/秒，颗粒 %dms，散布 %.2f 拍，倒放 %d%%，音高 %s，湿 %d%%）", freeze ? "冻结，" : "", density,
-                   grainMs, sprayBeats, (int)(reverseProb * 100), p.c_str(), (int)(mix * 100));
+        if (synced) return fmt("节奏粒子重组（%s每 %s 一粒，颗粒 %dms，散布 %.2f 秒，倒放 %d%%，音高 %s，湿 %d%%）", freeze ? "冻结，" : "", beatsName(stepBeats).c_str(),
+                               grainMs, spraySec, (int)(reverseProb * 100), p.c_str(), (int)(mix * 100));
+        return fmt("粒子云（%s密度 %.0f 粒/秒，颗粒 %dms，散布 %.2f 秒，倒放 %d%%，音高 %s，湿 %d%%）", freeze ? "冻结，" : "", density,
+                   grainMs, spraySec, (int)(reverseProb * 100), p.c_str(), (int)(mix * 100));
     }
 };
 
