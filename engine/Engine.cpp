@@ -134,6 +134,58 @@ int loudestPos(const Buffer& b) {
     return std::min(pos, b.size());
 }
 
+// Bus guard: no 10 ms frame away from the junction may be louder than -1 dB under the junction itself.
+// Returns the deepest cut applied (dB).
+float alignPeakToJunction(Buffer& b, int junction) {
+    const int h = std::max(1, b.sr / 100), nf = b.size() / h;
+    if (nf < 4) return 0.f;
+    const int kD = junction / h;
+    auto inJunction = [&](int k) { return k >= kD - 1 && k <= kD + 2; };
+    float deepest = 0.f;
+    for (int iter = 0; iter < 4; ++iter) {
+        float ref = 0.f;
+        for (int k = std::max(0, kD - 1); k <= std::min(nf - 1, kD + 2); ++k) ref = std::max(ref, stereoRms(b, k * h, (k + 1) * h));
+        if (ref <= 1e-9f) return deepest;
+        const float lim = ref * 0.89f;
+        std::vector<float> fg((size_t)nf, 1.f);
+        bool any = false;
+        for (int k = 0; k < nf; ++k) {
+            if (inJunction(k)) continue;
+            const float e = stereoRms(b, k * h, (k + 1) * h);
+            if (e > lim) { fg[(size_t)k] = 0.97f * lim / e; any = true; }
+        }
+        if (!any) break;
+        std::vector<float> sg((size_t)nf, 1.f);
+        for (int k = 0; k < nf; ++k) {
+            if (inJunction(k)) continue;
+            float m = 1.f;
+            for (int j = std::max(0, k - 2); j <= std::min(nf - 1, k + 2); ++j) m = std::min(m, fg[(size_t)j]);
+            sg[(size_t)k] = m;
+            deepest = std::max(deepest, -gainToDb(m));
+        }
+        for (int i = 0; i < b.size(); ++i) {
+            const float fpos = (float)i / (float)h - 0.5f;
+            const int k0 = std::clamp((int)std::floor(fpos), 0, nf - 1), k1 = std::min(k0 + 1, nf - 1);
+            const float tt = std::clamp(fpos - (float)k0, 0.f, 1.f);
+            const float g = sg[(size_t)k0] * (1.f - tt) + sg[(size_t)k1] * tt;
+            b.L[(size_t)i] *= g; b.R[(size_t)i] *= g;
+        }
+    }
+    return deepest;
+}
+
+// Where the loudest 10 ms frame sits relative to the junction, in ms.
+float peakOffsetMs(const Buffer& b, int junction) {
+    const int h = std::max(1, b.sr / 100);
+    float m = -1.f;
+    int best = 0;
+    for (int s = 0; s + h <= b.size(); s += h) {
+        const float v = stereoRms(b, s, s + h);
+        if (v > m) { m = v; best = s; }
+    }
+    return 1000.f * (float)(best - junction) / (float)b.sr;
+}
+
 float loudestRms(const Buffer& b) {
     const int w = std::max(1, b.sr / 10);
     float m = 0;
@@ -149,6 +201,7 @@ struct Track {
     bool reverse = false;
     float patternStep = 0.5f; // beats between repeats (Pattern role)
     int patternCount = 0;
+    float autoDepth = 0, autoCurve = 1; // gain automation towards / from the junction
     std::vector<std::unique_ptr<Effect>> fx;
     EnvelopeChoice env;
     Region region;
@@ -181,11 +234,16 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
     // ---- plan each track
     std::vector<Track> tracks;
     bool lowHitTaken = false;
+    // "breath" before the downbeat; build-ups then peak right before the gap
+    const bool gap = rng.chance(0.3f);
+    const float gapBeats = rng.pick<float>({0.125f, 0.25f});
+    const int junctionBuild = tl.downbeat - (gap ? tl.beats(gapBeats) : 0);
     for (int idx : used) {
         const Analysis& a = sources[(size_t)idx].analysis;
         Track t;
         t.input = idx;
         t.role = pickRole(a, rng, req.arrangeOnly);
+        if (t.role == Role::Fill) t.role = Role::Build; // every layer is anchored to the junction
         t.reverse = t.role == Role::BuildReverse || (t.role == Role::Downlift && a.shape == Shape::Rise);
         if (t.role == Role::Pattern) {
             t.patternStep = rng.pick<float>({0.5f, 0.25f, 1.f / 3.f, 0.125f});
@@ -200,6 +258,9 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         t.gainDb = low ? rng.range(-3.f, 0.f) : rng.range(-6.f, -1.f);
         t.pan = low ? 0.f : rng.range(-0.4f, 0.4f);
         if (t.role == Role::Downlift) t.gainDb -= 2.f; // a tail sits under the impact
+        if (t.role == Role::Build || t.role == Role::BuildReverse) { t.autoDepth = rng.range(6.f, 12.f); t.autoCurve = rng.range(1.5f, 3.f); }
+        else if (t.role == Role::Downlift) { t.autoDepth = rng.range(4.f, 8.f); t.autoCurve = 0.7f; }
+        else { t.autoDepth = rng.range(2.f, 5.f); t.autoCurve = 0.7f; }
         t.fit = (t.role == Role::Build) && a.rising && rng.chance(0.5f);
         if (low) {
             const bool isHit = t.role == Role::Hit || t.role == Role::Roll || t.role == Role::Pattern;
@@ -219,7 +280,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (t.reverse) reverseInPlace(src);
         if (t.role == Role::Downlift) cutBeforeLoudest(src);
         if (t.fit && src.size() > 0) {
-            const float ratio = (float)loudestPos(src) / (float)std::max(1, tl.downbeat);
+            const float ratio = (float)loudestPos(src) / (float)std::max(1, junctionBuild);
             if (ratio > 0.5f && ratio < 4.f) { t.fitRatio = ratio; src = varispeed(src, ratio); }
             else t.fit = false;
         }
@@ -230,7 +291,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         case Role::BuildReverse: {
             // the loudest point lands on the downbeat; whatever follows it rings on past the bar line
             const int anchor = loudestPos(src);
-            start = tl.downbeat - anchor;
+            start = junctionBuild - anchor;
             if (start < 0) { len += start; start = 0; }
             break;
         }
@@ -328,6 +389,19 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (t.role == Role::Hit || t.role == Role::Roll || t.role == Role::Pattern || t.role == Role::Downlift) envRegion = {tl.downbeat, std::min(tl.length, std::max(t.region.end, tl.downbeat + sr / 2))};
         applyEnvelope(t.env, tb, tl, envRegion);
 
+        // gain automation: build-ups swell into their peak at the junction; hits/tails fall away from it
+        {
+            const bool build = t.role == Role::Build || t.role == Role::BuildReverse;
+            const int a0 = t.region.start, j = build ? junctionBuild : tl.downbeat;
+            const int fallLen = t.role == Role::Downlift ? tl.beat() : sr * 15 / 100;
+            for (int i = 0; i < tl.length; ++i) {
+                float db = 0.f;
+                if (build && i < j && j > a0) db = -t.autoDepth * std::pow(1.f - std::clamp((float)(i - a0) / (float)(j - a0), 0.f, 1.f), t.autoCurve);
+                if (!build && i > j) db = -t.autoDepth * std::pow(std::min(1.f, (float)(i - j) / (float)fallLen), t.autoCurve);
+                const float g = dbToGain(db);
+                tb.L[(size_t)i] *= g; tb.R[(size_t)i] *= g;
+            }
+        }
         const float gl = std::sqrt(0.5f * (1 - t.pan)) * 1.41421f, gr = std::sqrt(0.5f * (1 + t.pan)) * 1.41421f;
         for (int i = 0; i < tl.length; ++i) { mix.L[(size_t)i] += tb.L[(size_t)i] * gl; mix.R[(size_t)i] += tb.R[(size_t)i] * gr; }
 
@@ -342,6 +416,8 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         trackReport += "，音量 " + fmtf("%.1f", t.gainDb) + " dB";
         if (t.pan != 0) trackReport += "，声像 " + fmtf("%+.2f", t.pan);
         if (t.extraHp > 0) trackReport += "，避让低频高通 150Hz";
+        if (t.role == Role::Build || t.role == Role::BuildReverse) trackReport += "\n  - 自动化：音量从 " + fmtf("-%.0f", t.autoDepth) + " dB 推到衔接点 0 dB（曲线 " + fmtf("%.1f", t.autoCurve) + "）";
+        else trackReport += "\n  - 自动化：衔接点 0 dB，之后 " + std::string(t.role == Role::Downlift ? "1 拍" : "150 ms") + "内降 " + fmtf("%.0f", t.autoDepth) + " dB";
         if (!req.arrangeOnly) trackReport += "\n  - 效果链：";
         for (size_t k = 0; k < t.fx.size(); ++k) trackReport += (k ? " → " : "") + t.fx[k]->describe();
         if (t.env.kind != EnvelopeChoice::None) trackReport += "\n  - 包络：" + t.env.describe();
@@ -356,8 +432,6 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
     }
 
     // ---- "breath": a short gap right before the downbeat
-    const bool gap = rng.chance(0.3f);
-    const float gapBeats = rng.pick<float>({0.125f, 0.25f});
     if (gap) {
         const int a = tl.downbeat - tl.beats(gapBeats), f = sr / 500;
         for (int i = std::max(0, a - f); i < tl.downbeat; ++i) {
@@ -394,14 +468,24 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
     }
     if (req.arrangeOnly) out = OutputOptions{};
     else processOutput(mix, out, tl);
+    // bus automation: whole mix rises into the junction
+    const float busDepth = rng.range(3.f, 6.f);
+    for (int i = 0; i < junctionBuild && i < tl.length; ++i) {
+        const float g = dbToGain(-busDepth * (1.f - (float)i / (float)std::max(1, junctionBuild)));
+        mix.L[(size_t)i] *= g; mix.R[(size_t)i] *= g;
+    }
     finalizeLoudness(mix, tl);
+    const float guardDb = alignPeakToJunction(mix, tl.downbeat);
+    const float offMs = peakOffsetMs(mix, tl.downbeat);
 
     res.audio = std::move(mix);
     res.downbeatSample = tl.downbeat;
     std::string r;
     r += "- 种子 " + std::to_string(req.seed) + (req.arrangeOnly ? std::string() : std::string("，风格骰子：") + styleName(req.style)) + "，时值 " + beatsLabel(req.lengthBeats) + " @ " +
          fmtf("%.0f", req.bpm) + " BPM（强拍在 " + fmtf("%.3f", (double)tl.downbeat / sr) + " 秒处）\n";
+    r += "- 最响处离衔接点：" + fmtf("%+.0f", offMs) + " ms（总线峰值保护最多压了 " + fmtf("%.1f", guardDb) + " dB）\n";
     r += trackReport;
+    r += "- 总线自动化：整体音量从 " + fmtf("-%.0f", busDepth) + " dB 推到衔接点\n";
     if (gap) r += "- 强拍前留气口：" + std::string(gapBeats == 0.125f ? "1/32" : "1/16") + " 静音\n";
     if (req.arrangeOnly) r += "- 只编排：没有效果器、包络和总线染色，只做统一响度和限幅\n";
     else {
