@@ -198,11 +198,14 @@ struct Track {
     Role role = Role::Fill;
     float transpose = 0, gainDb = 0, pan = 0, fitRatio = 1, extraHp = 0;
     bool fit = false;
+    bool coverage = false; // changed so the rise is not empty
     bool reverse = false;
     float patternStep = 0.5f; // beats between repeats (Pattern role)
     int patternCount = 0;
     float autoDepth = 0, autoCurve = 1; // gain automation towards / from the junction
     std::vector<std::unique_ptr<Effect>> fx;
+    struct Link { bool on = false, inverse = false; float lo = 0; };
+    std::vector<Link> links; // per effect: wet amount follows the transition curve
     EnvelopeChoice env;
     Region region;
 };
@@ -270,6 +273,39 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         tracks.push_back(std::move(t));
     }
 
+    // ---- coverage: the user-set rise must not be mostly silence. If every build-up is much shorter than
+    // the rise, slow the longest one down to fill it, or (too short even for that) repeat it on the grid.
+    {
+        auto prep = [&](const Track& t) {
+            const Source& s = sources[(size_t)t.input];
+            Buffer src = trimSilence(s.audio);
+            if (src.size() == 0) src = s.audio;
+            src = varispeed(src, semisToRatio(t.transpose));
+            if (t.reverse) reverseInPlace(src);
+            return src;
+        };
+        int earliest = tl.downbeat, best = -1, bestAnchor = 0;
+        for (size_t i = 0; i < tracks.size(); ++i) {
+            const Track& t = tracks[i];
+            if (t.role == Role::Pattern) earliest = std::min(earliest, tl.downbeat - tl.beats(t.patternStep * (float)t.patternCount));
+            if (t.role != Role::Build && t.role != Role::BuildReverse) continue;
+            const int anchor = loudestPos(prep(t));
+            earliest = std::min(earliest, junctionBuild - anchor);
+            if (anchor > bestAnchor) { bestAnchor = anchor; best = (int)i; }
+        }
+        if (earliest > tl.downbeat * 2 / 5 && best >= 0 && bestAnchor > 0) {
+            Track& t = tracks[(size_t)best];
+            const float ratio = (float)bestAnchor / (float)std::max(1, junctionBuild);
+            if (ratio >= 0.4f) { t.fit = true; t.coverage = true; }
+            else {
+                t.role = Role::Pattern;
+                t.coverage = true;
+                t.patternStep = req.lengthBeats >= 4.f ? 1.f : 0.5f;
+                t.patternCount = std::max(1, (int)std::floor(req.lengthBeats / t.patternStep + 1e-3f));
+            }
+        }
+    }
+
     // ---- place sources on the timeline
     int tail = sr * 5 / 2;
     for (auto& t : tracks) {
@@ -281,7 +317,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (t.role == Role::Downlift) cutBeforeLoudest(src);
         if (t.fit && src.size() > 0) {
             const float ratio = (float)loudestPos(src) / (float)std::max(1, junctionBuild);
-            if (ratio > 0.5f && ratio < 4.f) { t.fitRatio = ratio; src = varispeed(src, ratio); }
+            if (ratio > (t.coverage ? 0.39f : 0.5f) && ratio < 4.f) { t.fitRatio = ratio; src = varispeed(src, ratio); }
             else t.fit = false;
         }
         int start = 0;
@@ -307,7 +343,14 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         t.region = {start, start + len};
     }
     tail = std::min(tail, sr * 8);
-    tl.length = tl.downbeat + tail;
+    const int fallLen = req.fallBeats > 0 ? tl.beats(req.fallBeats) : 0;
+    tl.length = tl.downbeat + (fallLen > 0 ? fallLen : tail);
+    // the transition curve (like a single macro knob): 0 -> 1 over the rise, 1 -> 0 over the fall
+    const int motionFall = fallLen > 0 ? fallLen : tl.beat();
+    auto motion = [&](int i) {
+        if (i < tl.downbeat) return std::pow((float)i / (float)std::max(1, tl.downbeat), 1.5f);
+        return std::max(0.f, 1.f - (float)(i - tl.downbeat) / (float)motionFall);
+    };
 
     // ---- render each track
     Buffer mix(tl.length, sr);
@@ -382,7 +425,20 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         for (FxType c : chosen) t.fx.push_back(makeEffect(c, rng, lim, tl, t.region));
         Region fxRegion = t.region;
         if (t.role == Role::Roll) fxRegion.start = tl.downbeat;
-        for (auto& e : t.fx) e->process(tb, tl, fxRegion);
+        for (auto& e : t.fx) {
+            Track::Link lk;
+            if (rng.chance(0.6f)) { lk.on = true; lk.inverse = rng.chance(0.25f); lk.lo = rng.range(0.f, 0.4f); }
+            t.links.push_back(lk);
+            if (!lk.on) { e->process(tb, tl, fxRegion); continue; }
+            const Buffer dry = tb;
+            e->process(tb, tl, fxRegion);
+            for (int i = 0; i < tl.length; ++i) {
+                const float m = motion(i);
+                const float w = lk.inverse ? 1.f - (1.f - lk.lo) * m : lk.lo + (1.f - lk.lo) * m;
+                tb.L[(size_t)i] = dry.L[(size_t)i] + (tb.L[(size_t)i] - dry.L[(size_t)i]) * w;
+                tb.R[(size_t)i] = dry.R[(size_t)i] + (tb.R[(size_t)i] - dry.R[(size_t)i]) * w;
+            }
+        }
         if (!req.arrangeOnly) t.env = pickEnvelope(t.role, a, rng);
         Region envRegion = t.region;
         if (t.role == Role::Build || t.role == Role::BuildReverse) envRegion = {std::max(0, std::min(t.region.start, tl.downbeat - tl.beats(req.lengthBeats))), tl.downbeat};
@@ -410,6 +466,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (a.f0 > 0) trackReport += "，" + a.noteName();
         trackReport += "）\n  - 角色：" + std::string(roleName(t.role));
         if (t.reverse && t.role != Role::BuildReverse) trackReport += "，倒放";
+        if (t.coverage) trackReport += "（素材比上升段短太多，" + std::string(t.role == Role::Pattern ? "改成按拍重复铺满上升段" : "放慢铺满上升段") + "）";
         if (t.role == Role::Pattern) trackReport += "（每 " + beatsLabel(t.patternStep * 1.f) + " 一下，共 " + std::to_string(t.patternCount) + " 下）";
         if (t.transpose != 0) trackReport += "，变调 " + fmtf("%+.0f", t.transpose) + " 半音";
         if (t.fit) trackReport += "，拉伸到过渡长度（" + fmtf("%.2f", t.fitRatio) + " 倍速）";
@@ -419,7 +476,12 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (t.role == Role::Build || t.role == Role::BuildReverse) trackReport += "\n  - 自动化：音量从 " + fmtf("-%.0f", t.autoDepth) + " dB 推到衔接点 0 dB（曲线 " + fmtf("%.1f", t.autoCurve) + "）";
         else trackReport += "\n  - 自动化：衔接点 0 dB，之后 " + std::string(t.role == Role::Downlift ? "1 拍" : "150 ms") + "内降 " + fmtf("%.0f", t.autoDepth) + " dB";
         if (!req.arrangeOnly) trackReport += "\n  - 效果链：";
-        for (size_t k = 0; k < t.fx.size(); ++k) trackReport += (k ? " → " : "") + t.fx[k]->describe();
+        for (size_t k = 0; k < t.fx.size(); ++k) {
+            trackReport += (k ? " → " : "") + t.fx[k]->describe();
+            if (k < t.links.size() && t.links[k].on)
+                trackReport += t.links[k].inverse ? "〔效果量随过渡曲线反向：衔接点最干，" + fmtf("%.0f", t.links[k].lo * 100) + "%〕"
+                                                  : "〔效果量随过渡曲线：" + fmtf("%.0f", t.links[k].lo * 100) + "% → 衔接点 100%〕";
+        }
         if (t.env.kind != EnvelopeChoice::None) trackReport += "\n  - 包络：" + t.env.describe();
         trackReport += "\n";
     }
@@ -442,8 +504,12 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
 
     // ---- bus
     BusSettings bus;
-    bus.multiband = rng.chance(0.6f);
+    bus.multiband = req.fallBeats > 0 ? true : rng.chance(0.6f);
     bus.mbRatio = rng.range(2.f, 4.f);
+    if (req.fallBeats > 0) {
+        bus.compAmount = req.compAmount ? std::clamp(*req.compAmount, 0.f, 1.f) : rng.range(0.4f, 0.9f);
+        bus.mbRatio = 2.f + 6.f * bus.compAmount;
+    }
     bus.tiltLowDb = rng.range(-2.f, 2.f);
     bus.tiltHighDb = rng.range(-2.f, 2.f);
     if (req.style == Style::Ambient) { bus.spaceMix = rng.range(0.15f, 0.4f); }
@@ -474,13 +540,27 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         const float g = dbToGain(-busDepth * (1.f - (float)i / (float)std::max(1, junctionBuild)));
         mix.L[(size_t)i] *= g; mix.R[(size_t)i] *= g;
     }
-    finalizeLoudness(mix, tl);
-    const float guardDb = alignPeakToJunction(mix, tl.downbeat);
+    // stage 2 timing rule: hold right after the junction, then fall to silence exactly at the end
+    if (fallLen > 0) {
+        for (int i = tl.downbeat; i < tl.length; ++i) {
+            const float p = (float)(i - tl.downbeat) / (float)fallLen;
+            const float g = p < 0.25f ? 1.f : std::pow(std::max(0.f, 1.f - (p - 0.25f) / 0.75f), 1.6f);
+            mix.L[(size_t)i] *= g; mix.R[(size_t)i] *= g;
+        }
+        const int fi = std::min(tl.downbeat, sr / 200); // 5 ms fade-in at the very start
+        for (int i = 0; i < fi; ++i) { const float g = (float)i / (float)fi; mix.L[(size_t)i] *= g; mix.R[(size_t)i] *= g; }
+    }
+    float guardDb = alignPeakToJunction(mix, tl.downbeat);
+    finalizeLoudness(mix, tl, fallLen > 0);
+    guardDb = std::max(guardDb, alignPeakToJunction(mix, tl.downbeat)); // limiter may have flattened the junction
     const float offMs = peakOffsetMs(mix, tl.downbeat);
 
     res.audio = std::move(mix);
     res.downbeatSample = tl.downbeat;
     std::string r;
+    if (fallLen > 0)
+        r += "- 时值规则：上升 " + beatsLabel(req.lengthBeats) + "（" + fmtf("%.3f", (double)tl.downbeat / sr) + " 秒）+ 下降 " + beatsLabel(req.fallBeats) + "（" +
+             fmtf("%.3f", (double)fallLen / sr) + " 秒），文件总长精确 " + std::to_string(res.audio.size()) + " 采样\n";
     r += "- 种子 " + std::to_string(req.seed) + (req.arrangeOnly ? std::string() : std::string("，风格骰子：") + styleName(req.style)) + "，时值 " + beatsLabel(req.lengthBeats) + " @ " +
          fmtf("%.0f", req.bpm) + " BPM（强拍在 " + fmtf("%.3f", (double)tl.downbeat / sr) + " 秒处）\n";
     r += "- 最响处离衔接点：" + fmtf("%+.0f", offMs) + " ms（总线峰值保护最多压了 " + fmtf("%.1f", guardDb) + " dB）\n";

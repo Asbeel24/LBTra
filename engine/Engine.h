@@ -21,6 +21,10 @@ struct RenderRequest {
     float bpm = 90.f;
     std::optional<OutputOptions> forcedOutput; // user toggles; empty = let the dice choose
     bool arrangeOnly = false;  // stage 1: arrangement only, no effects / envelopes / bus colour
+    // stage 2 timing rule: rise = lengthBeats (start -> junction), fall = after the junction.
+    // fallBeats > 0 fixes the file to exactly rise + fall; 0 keeps the free tail.
+    float fallBeats = 0.f;
+    std::optional<float> compAmount; // 0..1 bus compression; empty = dice
 };
 
 struct RenderResult {

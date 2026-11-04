@@ -54,6 +54,7 @@ void applyEnvelope(const EnvelopeChoice& e, Buffer& b, const Timeline& t, const 
 struct BusSettings {
     bool multiband = true;        // else gentle EQ
     float mbRatio = 3.f;
+    float compAmount = 0.f;       // 0..1: deeper threshold, higher ratio, upward compression (OTT-style), glue comp
     float tiltLowDb = 0, tiltHighDb = 0;
     float spaceMix = 0.f, spaceDecay = 1.5f;
     std::string describe() const;
@@ -73,6 +74,7 @@ struct OutputOptions {
 void processOutput(Buffer& b, const OutputOptions& o, const Timeline& t);
 
 // Loudness to a common level + peak limiter at -1 dBFS + tail fade.
-void finalizeLoudness(Buffer& b, const Timeline& t);
+// fixedLength: keep the buffer length (stage 2 timing rule) instead of trimming the tail.
+void finalizeLoudness(Buffer& b, const Timeline& t, bool fixedLength = false);
 
 } // namespace lb

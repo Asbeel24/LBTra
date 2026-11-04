@@ -621,7 +621,9 @@ void applyEnvelope(const EnvelopeChoice& e, Buffer& b, const Timeline& t, const 
 
 // ------------------------------------------------------------------ Bus
 std::string BusSettings::describe() const {
-    std::string s = multiband ? fmt("多段压缩（3 段，180Hz / 3.5kHz 分频，比率 %.1f:1）", mbRatio) : std::string("整体 EQ（25Hz 低切）");
+    std::string s = multiband ? fmt("多段压缩（3 段，180Hz / 3.5kHz 分频，比率 %.1f:1，压缩量 %d%%%s）", mbRatio, (int)(compAmount * 100),
+                                    compAmount > 0.01f ? "，含向上压缩和整体粘合" : "")
+                              : std::string("整体 EQ（25Hz 低切）");
     s += fmt("；总 EQ（低架 %+.1fdB，高架 %+.1fdB）", tiltLowDb, tiltHighDb);
     if (spaceMix > 0.01f) s += fmt("；总混响（衰减 %.1fs，湿 %d%%）", spaceDecay, (int)(spaceMix * 100));
     else s += "；总混响关";
@@ -629,21 +631,25 @@ std::string BusSettings::describe() const {
 }
 
 namespace {
-void compressBand(std::vector<float>& l, std::vector<float>& r, float ratio, int sr) {
-    // threshold sits 6 dB under the band's loudest 50 ms
+void compressBand(std::vector<float>& l, std::vector<float>& r, float ratio, int sr, float amount = 0.f, float attackMs = 5.f, float releaseMs = 80.f) {
+    // threshold sits 6 dB (+ up to 12 dB with amount) under the band's loudest 50 ms;
+    // with amount > 0 quiet parts are also lifted (upward compression, OTT-style)
     float pk = 0;
     const int w = sr / 20;
     for (int s = 0; s + w < (int)l.size(); s += w / 2) pk = std::max(pk, std::sqrt(0.5f * (rms(l, s, s + w) * rms(l, s, s + w) + rms(r, s, s + w) * rms(r, s, s + w))));
     if (pk < 1e-6f) return;
-    const float thr = gainToDb(pk) - 6.f;
-    const float at = std::exp(-1.f / (0.005f * sr)), rl = std::exp(-1.f / (0.08f * sr));
-    float env = 0, makeup = (thr + 6.f - (thr + 6.f / ratio)) * 0.5f;
+    const float depth = 6.f + 12.f * amount;
+    const float thr = gainToDb(pk) - depth;
+    const float upThr = thr - 18.f, upMax = 10.f * amount;
+    const float at = std::exp(-1.f / (attackMs * 0.001f * sr)), rl = std::exp(-1.f / (releaseMs * 0.001f * sr));
+    float env = 0, makeup = depth * (1.f - 1.f / ratio) * 0.5f;
     for (size_t i = 0; i < l.size(); ++i) {
         const float x = std::max(std::fabs(l[i]), std::fabs(r[i]));
         env = x > env ? at * env + (1 - at) * x : rl * env + (1 - rl) * x;
         const float db = gainToDb(env);
         const float over = db - thr;
-        const float gr = over > 0 ? -over * (1.f - 1.f / ratio) : 0.f;
+        float gr = over > 0 ? -over * (1.f - 1.f / ratio) : 0.f;
+        if (upMax > 0 && db < thr && db > upThr - 30.f) gr += std::min(upMax, (thr - std::max(db, upThr)) * 0.5f);
         const float g = dbToGain(gr + makeup);
         l[i] *= g; r[i] *= g;
     }
@@ -664,13 +670,15 @@ void processBus(Buffer& b, const BusSettings& s, const Timeline&) {
         std::vector<float> lowL, restL, midL, highL, lowR, restR, midR, highR;
         split(b.L, 180.f, lowL, restL); split(restL, 3500.f, midL, highL);
         split(b.R, 180.f, lowR, restR); split(restR, 3500.f, midR, highR);
-        compressBand(lowL, lowR, s.mbRatio, b.sr);
-        compressBand(midL, midR, s.mbRatio, b.sr);
-        compressBand(highL, highR, s.mbRatio, b.sr);
+        compressBand(lowL, lowR, s.mbRatio, b.sr, s.compAmount, 10.f, 120.f);
+        compressBand(midL, midR, s.mbRatio, b.sr, s.compAmount);
+        compressBand(highL, highR, s.mbRatio, b.sr, s.compAmount, 2.f, 60.f);
         for (int i = 0; i < b.size(); ++i) {
             b.L[(size_t)i] = lowL[(size_t)i] + midL[(size_t)i] + highL[(size_t)i];
             b.R[(size_t)i] = lowR[(size_t)i] + midR[(size_t)i] + highR[(size_t)i];
         }
+        // full-band glue after the split bands
+        if (s.compAmount > 0.01f) compressBand(b.L, b.R, 2.f + 2.f * s.compAmount, b.sr, 0.f, 10.f, 150.f);
     }
     Biquad eq[2][3];
     for (auto& ch : eq) {
@@ -751,13 +759,25 @@ void processOutput(Buffer& b, const OutputOptions& o, const Timeline& t) {
     }
 }
 
-void finalizeLoudness(Buffer& b, const Timeline& t) {
+void finalizeLoudness(Buffer& b, const Timeline& t, bool fixedLength) {
     // level: loudest 300 ms window around the transition brought to -10 dBFS RMS
     const int w = b.sr * 3 / 10;
     float loud = 0;
     for (int s = 0; s + w <= b.size(); s += w / 3) loud = std::max(loud, stereoRms(b, s, s + w));
     if (loud > 1e-6f) {
-        const float g = dbToGain(-10.f) / loud;
+        float g = dbToGain(-10.f) / loud;
+        // long, mostly quiet files (2 bar builds) also get a body-loudness floor: gated mean RMS of
+        // 50 ms frames to -17 dBFS, at most +6 dB above the peak-window gain; the limiter catches the rest
+        const int fw = b.sr / 20;
+        double acc = 0; int n = 0;
+        for (int s = 0; s + fw <= b.size(); s += fw) {
+            const float e = stereoRms(b, s, s + fw);
+            if (e > loud * dbToGain(-30.f)) { acc += (double)e * e; ++n; }
+        }
+        if (n > 0) {
+            const float body = (float)std::sqrt(acc / n);
+            g = std::max(g, std::min(dbToGain(-17.f) / body, g * dbToGain(6.f)));
+        }
         for (int i = 0; i < b.size(); ++i) { b.L[(size_t)i] *= g; b.R[(size_t)i] *= g; }
     }
     // limiter: 1.5 ms lookahead, -1 dBFS ceiling, 80 ms release
@@ -776,6 +796,11 @@ void finalizeLoudness(Buffer& b, const Timeline& t) {
     for (int i = 0; i < b.size(); ++i) {
         g = std::min(need[(size_t)i], rel * g + (1 - rel));
         b.L[(size_t)i] *= g; b.R[(size_t)i] *= g;
+    }
+    if (fixedLength) {
+        const int f = std::min(b.size() / 4, b.sr / 100);
+        for (int i = 0; i < f; ++i) { const float gg = (float)i / (float)f; b.L[(size_t)(b.size() - 1 - i)] *= gg; b.R[(size_t)(b.size() - 1 - i)] *= gg; }
+        return;
     }
     // trim trailing silence (keep at least 300 ms after the downbeat), then fade the last 150 ms
     int end = b.size();
