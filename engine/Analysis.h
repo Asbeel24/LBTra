@@ -6,11 +6,15 @@ namespace lb {
 
 enum class Kind { Tonal, Percussive, FX, Loop };
 enum class Register { Low, Mid, High };
+// Loudness shape over time: decides where a sound can sit in a transition.
+enum class Shape { Rise, Fall, Hit, Sustain, Loop };
 
 struct Analysis {
     std::string name;
     Kind kind = Kind::FX;
     Register reg = Register::Mid;
+    Shape shape = Shape::Sustain;
+    float halfEnergyRatio = 1; // energy of 2nd half / 1st half (audible part)
     float duration = 0;        // seconds
     float attackMs = 0;        // first audible frame -> loudest frame
     float peakPos = 0;         // 0..1, where the loudest point sits
@@ -29,6 +33,7 @@ struct Analysis {
 
     std::string kindName() const;    // Chinese label
     std::string regName() const;
+    std::string shapeName() const;
     std::string noteName() const;
 };
 

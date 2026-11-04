@@ -15,20 +15,25 @@ const char* styleName(Style s) {
 
 namespace {
 
-enum class Role { Build, BuildReverse, Hit, Fill, Roll };
+enum class Role { Build, BuildReverse, Hit, Fill, Roll, Downlift, Pattern };
 
 const char* roleName(Role r) {
     switch (r) {
-    case Role::Build: return "铺垫（正放，末尾对齐强拍）";
-    case Role::BuildReverse: return "倒放铺垫（音头落在强拍）";
+    case Role::Build: return "铺垫（正放，最响处对齐强拍）";
+    case Role::BuildReverse: return "倒放铺垫（倒放后最响处落在强拍）";
     case Role::Hit: return "强拍上的 impact";
     case Role::Fill: return "从过渡开头直接放";
     case Role::Roll: return "强拍 impact + 强拍前连击";
+    case Role::Downlift: return "下降尾巴（从强拍开始往下走）";
+    case Role::Pattern: return "强拍前按节奏重复几下，再落在强拍";
     }
     return "?";
 }
 
 std::string beatsLabel(float b) {
+    if (std::fabs(b - 0.125f) < 1e-3f) return "1/32";
+    if (std::fabs(b - 0.25f) < 1e-3f) return "1/16";
+    if (std::fabs(b - 1.f / 3.f) < 1e-3f) return "1/8T";
     if (b == 0.5f) return "1/8";
     if (b == 1.f) return "1/4";
     if (b == 2.f) return "1/2";
@@ -39,20 +44,18 @@ std::string beatsLabel(float b) {
     return buf;
 }
 
-Role pickRole(const Analysis& a, Rng& r) {
+Role pickRole(const Analysis& a, Rng& r, bool arrangeOnly) {
     const bool low = a.reg == Register::Low;
-    switch (a.kind) {
-    case Kind::Tonal:
-        if (low) return std::vector<Role>{Role::Hit, Role::Roll, Role::BuildReverse}[(size_t)r.weighted({0.55f, 0.3f, 0.15f})];
-        return std::vector<Role>{Role::BuildReverse, Role::Hit, Role::Fill, Role::Roll}[(size_t)r.weighted({0.4f, 0.3f, 0.15f, 0.15f})];
-    case Kind::Percussive:
-        return std::vector<Role>{Role::Hit, Role::Roll, Role::BuildReverse}[(size_t)r.weighted({0.45f, 0.4f, 0.15f})];
-    case Kind::Loop:
-        return std::vector<Role>{Role::Build, Role::Fill}[(size_t)r.weighted({0.6f, 0.4f})];
-    case Kind::FX:
-    default:
-        if (a.rising) return std::vector<Role>{Role::Build, Role::Fill}[(size_t)r.weighted({0.85f, 0.15f})];
-        return std::vector<Role>{Role::BuildReverse, Role::Hit, Role::Fill, Role::Build}[(size_t)r.weighted({0.35f, 0.25f, 0.2f, 0.2f})];
+    const Role hitOrRoll = arrangeOnly ? Role::Pattern : Role::Roll;
+    switch (a.shape) {
+    case Shape::Rise: return std::vector<Role>{Role::Build, Role::Downlift}[(size_t)r.weighted({0.8f, 0.2f})];
+    case Shape::Fall: return std::vector<Role>{Role::Downlift, Role::BuildReverse, Role::Hit}[(size_t)r.weighted({0.45f, 0.4f, 0.15f})];
+    case Shape::Hit:
+        if (low) return std::vector<Role>{Role::Hit, hitOrRoll, Role::BuildReverse}[(size_t)r.weighted({0.55f, 0.3f, 0.15f})];
+        return std::vector<Role>{Role::Hit, Role::BuildReverse, hitOrRoll, Role::Fill}[(size_t)r.weighted({0.3f, 0.35f, 0.25f, 0.1f})];
+    case Shape::Loop: return std::vector<Role>{Role::Build, Role::Fill}[(size_t)r.weighted({0.6f, 0.4f})];
+    case Shape::Sustain:
+    default: return std::vector<Role>{Role::Fill, Role::Build, Role::BuildReverse, Role::Hit}[(size_t)r.weighted({0.3f, 0.25f, 0.3f, 0.15f})];
     }
 }
 
@@ -91,6 +94,8 @@ EnvelopeChoice pickEnvelope(Role role, const Analysis& a, Rng& r) {
     case Role::Hit:
     case Role::Roll: e.kind = a.reg == Register::Low ? r.pick<K>({K::Dive, K::TapeStop, K::FadeOut}) : r.pick<K>({K::TapeStop, K::Dive, K::FadeOut, K::Pump}); break;
     case Role::Fill: e.kind = r.pick<K>({K::Swell, K::LowpassOpen, K::Pump, K::FadeOut, K::TapeStop}); break;
+    case Role::Downlift: e.kind = r.pick<K>({K::FadeOut, K::Dive, K::TapeStop}); break;
+    case Role::Pattern: e.kind = r.pick<K>({K::FadeOut, K::Dive}); break;
     }
     return e;
 }
@@ -108,6 +113,27 @@ Buffer trimSilence(const Buffer& b) {
     return out;
 }
 
+// Start of the loudest 10 ms: the point that should land on the downbeat for a build-up.
+int loudestPos(const Buffer& b);
+// A downlifter starts at its loudest point: the quiet lead-in would land after the bar line otherwise.
+void cutBeforeLoudest(Buffer& b) {
+    const int from = std::max(0, loudestPos(b) - b.sr / 100);
+    if (from <= 0) return;
+    b.L.erase(b.L.begin(), b.L.begin() + from);
+    b.R.erase(b.R.begin(), b.R.begin() + from);
+}
+
+int loudestPos(const Buffer& b) {
+    const int w = std::max(1, b.sr / 100);
+    float m = -1.f;
+    int pos = std::max(0, b.size() - 1);
+    for (int s = 0; s + w <= b.size(); s += w) {
+        const float v = stereoRms(b, s, s + w);
+        if (v > m) { m = v; pos = s + w; }
+    }
+    return std::min(pos, b.size());
+}
+
 float loudestRms(const Buffer& b) {
     const int w = std::max(1, b.sr / 10);
     float m = 0;
@@ -120,6 +146,9 @@ struct Track {
     Role role = Role::Fill;
     float transpose = 0, gainDb = 0, pan = 0, fitRatio = 1, extraHp = 0;
     bool fit = false;
+    bool reverse = false;
+    float patternStep = 0.5f; // beats between repeats (Pattern role)
+    int patternCount = 0;
     std::vector<std::unique_ptr<Effect>> fx;
     EnvelopeChoice env;
     Region region;
@@ -156,17 +185,24 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         const Analysis& a = sources[(size_t)idx].analysis;
         Track t;
         t.input = idx;
-        t.role = pickRole(a, rng);
+        t.role = pickRole(a, rng, req.arrangeOnly);
+        t.reverse = t.role == Role::BuildReverse || (t.role == Role::Downlift && a.shape == Shape::Rise);
+        if (t.role == Role::Pattern) {
+            t.patternStep = rng.pick<float>({0.5f, 0.25f, 1.f / 3.f, 0.125f});
+            const int maxCount = std::max(1, (int)std::floor(std::min(req.lengthBeats, 2.f) / t.patternStep + 1e-3f));
+            t.patternCount = rng.irange(std::min(2, maxCount), std::min(8, maxCount));
+        }
         const bool low = a.reg == Register::Low;
         if (a.kind == Kind::Tonal || a.kind == Kind::Percussive)
-            t.transpose = low ? rng.pick<float>({0.f, 0.f, 0.f, 12.f, 7.f, -5.f}) : rng.pick<float>({0.f, 0.f, 12.f, -12.f, 7.f, -5.f});
+            t.transpose = low ? rng.pick<float>({0.f, 0.f, 0.f, 0.f, 12.f}) : rng.pick<float>({0.f, 0.f, 12.f, -12.f, 7.f, -5.f});
         else
             t.transpose = rng.pick<float>({0.f, 0.f, 0.f, 5.f, -5.f, 12.f, -12.f});
         t.gainDb = low ? rng.range(-3.f, 0.f) : rng.range(-6.f, -1.f);
         t.pan = low ? 0.f : rng.range(-0.4f, 0.4f);
+        if (t.role == Role::Downlift) t.gainDb -= 2.f; // a tail sits under the impact
         t.fit = (t.role == Role::Build) && a.rising && rng.chance(0.5f);
         if (low) {
-            const bool isHit = t.role == Role::Hit || t.role == Role::Roll;
+            const bool isHit = t.role == Role::Hit || t.role == Role::Roll || t.role == Role::Pattern;
             if (isHit && !lowHitTaken) lowHitTaken = true;
             else t.extraHp = 150.f; // keep one low-end owner
         }
@@ -180,9 +216,10 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         Buffer src = trimSilence(s.audio);
         if (src.size() == 0) src = s.audio;
         src = varispeed(src, semisToRatio(t.transpose));
-        if (t.role == Role::BuildReverse) reverseInPlace(src);
+        if (t.reverse) reverseInPlace(src);
+        if (t.role == Role::Downlift) cutBeforeLoudest(src);
         if (t.fit && src.size() > 0) {
-            const float ratio = (float)src.size() / (float)std::max(1, tl.downbeat);
+            const float ratio = (float)loudestPos(src) / (float)std::max(1, tl.downbeat);
             if (ratio > 0.5f && ratio < 4.f) { t.fitRatio = ratio; src = varispeed(src, ratio); }
             else t.fit = false;
         }
@@ -190,15 +227,22 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         int len = src.size();
         switch (t.role) {
         case Role::Build:
-        case Role::BuildReverse:
-            if (len > tl.downbeat) len = tl.downbeat;
-            start = tl.downbeat - len;
+        case Role::BuildReverse: {
+            // the loudest point lands on the downbeat; whatever follows it rings on past the bar line
+            const int anchor = loudestPos(src);
+            start = tl.downbeat - anchor;
+            if (start < 0) { len += start; start = 0; }
             break;
+        }
         case Role::Hit:
-        case Role::Roll: start = tl.downbeat; break;
+        case Role::Roll:
+        case Role::Downlift: start = tl.downbeat; break;
+        case Role::Pattern: start = tl.downbeat - tl.beats(t.patternStep * (float)t.patternCount); break;
         case Role::Fill: start = 0; break;
         }
-        if (t.role == Role::Hit || t.role == Role::Roll || t.role == Role::Fill) tail = std::max(tail, start + len - tl.downbeat + sr * 3 / 2);
+        if (t.role == Role::Pattern) len = tl.downbeat - start + src.size();
+        tail = std::max(tail, std::min(start + len - tl.downbeat + sr / 2, sr * 8));
+        if (t.role != Role::Build && t.role != Role::BuildReverse) tail = std::max(tail, start + len - tl.downbeat + sr * 3 / 2);
         t.region = {start, start + len};
     }
     tail = std::min(tail, sr * 8);
@@ -214,7 +258,8 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         Buffer src = trimSilence(s.audio);
         if (src.size() == 0) src = s.audio;
         src = varispeed(src, semisToRatio(t.transpose));
-        if (t.role == Role::BuildReverse) reverseInPlace(src);
+        if (t.reverse) reverseInPlace(src);
+        if (t.role == Role::Downlift) cutBeforeLoudest(src);
         if (t.fit) src = varispeed(src, t.fitRatio);
         // gain staging: loudest 100 ms at -16 dBFS, then the dice gain
         const float lr = loudestRms(src);
@@ -223,14 +268,31 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         const bool takeTail = t.role == Role::Build || t.role == Role::BuildReverse;
         Buffer tb(tl.length, sr);
         const int fadeIn = takeTail && offset > 0 ? sr / 50 : 0;
-        for (int i = 0; t.region.start + i < tl.length && i < t.region.end - t.region.start; ++i) {
-            const int si = (takeTail ? offset : 0) + i;
-            if (si >= src.size()) break;
-            const float w = (fadeIn > 0 && i < fadeIn) ? (float)i / (float)fadeIn : 1.f;
-            tb.L[(size_t)(t.region.start + i)] = src.L[(size_t)si] * g * w;
-            tb.R[(size_t)(t.region.start + i)] = src.R[(size_t)si] * g * w;
+        if (t.role == Role::Pattern) {
+            // repeats on the grid before the downbeat (each cut to one step, getting louder), then the full hit
+            const int step = std::max(64, tl.beats(t.patternStep)), fade = sr / 300;
+            for (int k = t.patternCount; k >= 0; --k) {
+                const int at = tl.downbeat - k * step;
+                const int n = k == 0 ? src.size() : std::min(src.size(), step);
+                const float gk = k == 0 ? 1.f : 0.35f + 0.5f * (float)(t.patternCount - k) / (float)std::max(1, t.patternCount);
+                for (int i = 0; i < n && at + i < tl.length; ++i) {
+                    if (at + i < 0) continue;
+                    float w = 1.f;
+                    if (k > 0 && i > n - fade) w = (float)(n - i) / (float)fade;
+                    tb.L[(size_t)(at + i)] += src.L[(size_t)i] * g * gk * w;
+                    tb.R[(size_t)(at + i)] += src.R[(size_t)i] * g * gk * w;
+                }
+            }
+        } else {
+            for (int i = 0; t.region.start + i < tl.length && i < t.region.end - t.region.start; ++i) {
+                const int si = (takeTail ? offset : 0) + i;
+                if (si >= src.size()) break;
+                const float w = (fadeIn > 0 && i < fadeIn) ? (float)i / (float)fadeIn : 1.f;
+                tb.L[(size_t)(t.region.start + i)] = src.L[(size_t)si] * g * w;
+                tb.R[(size_t)(t.region.start + i)] = src.R[(size_t)si] * g * w;
+            }
         }
-        if (t.extraHp > 0) {
+        if (t.extraHp > 0 && !req.arrangeOnly) {
             Biquad h[2];
             h[0].set(Biquad::HP, t.extraHp, 0.707f, 0, (float)sr); h[1] = h[0];
             for (int i = 0; i < tl.length; ++i) { tb.L[(size_t)i] = h[0].process(tb.L[(size_t)i]); tb.R[(size_t)i] = h[1].process(tb.R[(size_t)i]); }
@@ -244,7 +306,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         lim.allowPitch = !lim.lowRegister;
         std::vector<FxType> chosen;
         if (t.role == Role::Roll) chosen.push_back(FxType::Stutter);
-        const int count = std::min(kMaxFxPerTrack, (int)chosen.size() + 1 + rng.weighted({0.3f, 0.4f, 0.3f}));
+        const int count = req.arrangeOnly ? 0 : std::min(kMaxFxPerTrack, (int)chosen.size() + 1 + rng.weighted({0.3f, 0.4f, 0.3f}));
         auto w = fxWeights(a, req.style, t.role);
         while ((int)chosen.size() < count) {
             for (FxType c : chosen) w[(size_t)c] = 0.f;
@@ -260,25 +322,27 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         Region fxRegion = t.region;
         if (t.role == Role::Roll) fxRegion.start = tl.downbeat;
         for (auto& e : t.fx) e->process(tb, tl, fxRegion);
-        t.env = pickEnvelope(t.role, a, rng);
+        if (!req.arrangeOnly) t.env = pickEnvelope(t.role, a, rng);
         Region envRegion = t.region;
         if (t.role == Role::Build || t.role == Role::BuildReverse) envRegion = {std::max(0, std::min(t.region.start, tl.downbeat - tl.beats(req.lengthBeats))), tl.downbeat};
-        if (t.role == Role::Hit || t.role == Role::Roll) envRegion = {tl.downbeat, std::min(tl.length, std::max(t.region.end, tl.downbeat + sr / 2))};
+        if (t.role == Role::Hit || t.role == Role::Roll || t.role == Role::Pattern || t.role == Role::Downlift) envRegion = {tl.downbeat, std::min(tl.length, std::max(t.region.end, tl.downbeat + sr / 2))};
         applyEnvelope(t.env, tb, tl, envRegion);
 
         const float gl = std::sqrt(0.5f * (1 - t.pan)) * 1.41421f, gr = std::sqrt(0.5f * (1 + t.pan)) * 1.41421f;
         for (int i = 0; i < tl.length; ++i) { mix.L[(size_t)i] += tb.L[(size_t)i] * gl; mix.R[(size_t)i] += tb.R[(size_t)i] * gr; }
 
         // report
-        trackReport += "- **第 " + std::to_string(ti + 1) + " 轨：" + a.name + "**（识别：" + a.kindName() + "，" + a.regName() + "音域";
+        trackReport += "- **第 " + std::to_string(ti + 1) + " 轨：" + a.name + "**（识别：" + a.kindName() + "，响度形状" + a.shapeName() + "，" + a.regName() + "音域";
         if (a.f0 > 0) trackReport += "，" + a.noteName();
         trackReport += "）\n  - 角色：" + std::string(roleName(t.role));
+        if (t.reverse && t.role != Role::BuildReverse) trackReport += "，倒放";
+        if (t.role == Role::Pattern) trackReport += "（每 " + beatsLabel(t.patternStep * 1.f) + " 一下，共 " + std::to_string(t.patternCount) + " 下）";
         if (t.transpose != 0) trackReport += "，变调 " + fmtf("%+.0f", t.transpose) + " 半音";
         if (t.fit) trackReport += "，拉伸到过渡长度（" + fmtf("%.2f", t.fitRatio) + " 倍速）";
         trackReport += "，音量 " + fmtf("%.1f", t.gainDb) + " dB";
         if (t.pan != 0) trackReport += "，声像 " + fmtf("%+.2f", t.pan);
         if (t.extraHp > 0) trackReport += "，避让低频高通 150Hz";
-        trackReport += "\n  - 效果链：";
+        if (!req.arrangeOnly) trackReport += "\n  - 效果链：";
         for (size_t k = 0; k < t.fx.size(); ++k) trackReport += (k ? " → " : "") + t.fx[k]->describe();
         if (t.env.kind != EnvelopeChoice::None) trackReport += "\n  - 包络：" + t.env.describe();
         trackReport += "\n";
@@ -311,7 +375,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
     if (req.style == Style::Ambient) { bus.spaceMix = rng.range(0.15f, 0.4f); }
     else if (rng.chance(0.6f)) bus.spaceMix = rng.range(0.f, 0.25f);
     bus.spaceDecay = rng.range(0.6f, 2.5f);
-    processBus(mix, bus, tl);
+    if (!req.arrangeOnly) processBus(mix, bus, tl);
 
     // ---- output options
     OutputOptions out;
@@ -328,18 +392,22 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         out.finalReverbMix = rng.range(0.15f, 0.35f);
         if (rng.chance(0.3f)) out.finalEq = rng.chance(0.7f) ? OutputOptions::Telephone : OutputOptions::Darken;
     }
-    processOutput(mix, out, tl);
+    if (req.arrangeOnly) out = OutputOptions{};
+    else processOutput(mix, out, tl);
     finalizeLoudness(mix, tl);
 
     res.audio = std::move(mix);
     res.downbeatSample = tl.downbeat;
     std::string r;
-    r += "- 种子 " + std::to_string(req.seed) + "，风格骰子：" + styleName(req.style) + "，时值 " + beatsLabel(req.lengthBeats) + " @ " +
+    r += "- 种子 " + std::to_string(req.seed) + (req.arrangeOnly ? std::string() : std::string("，风格骰子：") + styleName(req.style)) + "，时值 " + beatsLabel(req.lengthBeats) + " @ " +
          fmtf("%.0f", req.bpm) + " BPM（强拍在 " + fmtf("%.3f", (double)tl.downbeat / sr) + " 秒处）\n";
     r += trackReport;
     if (gap) r += "- 强拍前留气口：" + std::string(gapBeats == 0.125f ? "1/32" : "1/16") + " 静音\n";
-    r += "- 总线：" + bus.describe() + "\n";
-    r += "- 输出选项：" + out.describe() + "\n";
+    if (req.arrangeOnly) r += "- 只编排：没有效果器、包络和总线染色，只做统一响度和限幅\n";
+    else {
+        r += "- 总线：" + bus.describe() + "\n";
+        r += "- 输出选项：" + out.describe() + "\n";
+    }
     res.report = r;
     return res;
 }

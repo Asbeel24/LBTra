@@ -22,6 +22,17 @@ std::string Analysis::regName() const {
     return "?";
 }
 
+std::string Analysis::shapeName() const {
+    switch (shape) {
+    case Shape::Rise: return "上升";
+    case Shape::Fall: return "下降";
+    case Shape::Hit: return "打击（起音后衰减）";
+    case Shape::Sustain: return "持续";
+    case Shape::Loop: return "loop";
+    }
+    return "?";
+}
+
 std::string Analysis::noteName() const {
     if (f0 <= 0) return "-";
     static const char* names[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
@@ -115,6 +126,7 @@ Analysis analyze(const Buffer& b, const std::string& name) {
         for (size_t i = first; i < mid; ++i) e1 += env[i] * env[i];
         for (size_t i = mid; i <= last; ++i) e2 += env[i] * env[i];
         a.rising = a.peakPos > 0.6f && e2 > e1 * 2.0;
+        a.halfEnergyRatio = (float)(e2 / std::max(e1, 1e-12));
     }
 
     // --- spectrum: flatness and centroid averaged over loud frames
@@ -218,6 +230,13 @@ Analysis analyze(const Buffer& b, const std::string& name) {
     else if (stablePitch) a.kind = Kind::Tonal;
     else if (a.sharpAttack && (a.lastAudible - a.firstAudible) < sr * 0.8f) a.kind = Kind::Percussive;
     else a.kind = Kind::FX;
+
+    // loudness shape
+    if (a.kind == Kind::Loop) a.shape = Shape::Loop;
+    else if (a.rising) a.shape = Shape::Rise;
+    else if (a.sharpAttack && a.peakPos < 0.15f) a.shape = Shape::Hit;
+    else if (a.peakPos < 0.4f && a.halfEnergyRatio < 0.5f) a.shape = Shape::Fall;
+    else a.shape = Shape::Sustain;
 
     const float refHz = (a.kind == Kind::Tonal && a.f0 > 0) ? a.f0 : a.centroid * 0.25f;
     a.reg = refHz < 150.f ? Register::Low : (refHz < 600.f ? Register::Mid : Register::High);

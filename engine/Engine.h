@@ -20,6 +20,7 @@ struct RenderRequest {
     float lengthBeats = 4.f;   // 0.5 = 1/8, 1 = 1/4, 2 = 1/2, 4 = 1 bar, 8 = 2 bar
     float bpm = 90.f;
     std::optional<OutputOptions> forcedOutput; // user toggles; empty = let the dice choose
+    bool arrangeOnly = false;  // stage 1: arrangement only, no effects / envelopes / bus colour
 };
 
 struct RenderResult {
