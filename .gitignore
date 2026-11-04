@@ -1,0 +1,5 @@
+build/
+renders/
+*.wav
+!tests/data/*.wav
+.DS_Store
