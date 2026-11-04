@@ -203,6 +203,10 @@ struct Track {
     float patternStep = 0.5f; // beats between repeats (Pattern role)
     int patternCount = 0;
     float autoDepth = 0, autoCurve = 1; // gain automation towards / from the junction
+    // volume shape (stage 3): how the layer moves into / out of the junction
+    enum VolShape { Swell, Steps, GateRise, PumpRise, Decay, Cut, PumpFall, GateFall } vol = Swell;
+    float volStep = 0.5f;   // beats: step / gate / pump grid
+    float cutAfter = -1.f;  // beats after the junction where a build-up's ring-out is cut (-1 = rings on)
     std::vector<std::unique_ptr<Effect>> fx;
     struct Link { bool on = false, inverse = false; float lo = 0; };
     std::vector<Link> links; // per effect: wet amount follows the transition curve
@@ -296,7 +300,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (earliest > tl.downbeat * 2 / 5 && best >= 0 && bestAnchor > 0) {
             Track& t = tracks[(size_t)best];
             const float ratio = (float)bestAnchor / (float)std::max(1, junctionBuild);
-            if (ratio >= 0.4f) { t.fit = true; t.coverage = true; }
+            if (ratio >= 0.3f) { t.fit = true; t.coverage = true; }
             else {
                 t.role = Role::Pattern;
                 t.coverage = true;
@@ -317,7 +321,7 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (t.role == Role::Downlift) cutBeforeLoudest(src);
         if (t.fit && src.size() > 0) {
             const float ratio = (float)loudestPos(src) / (float)std::max(1, junctionBuild);
-            if (ratio > (t.coverage ? 0.39f : 0.5f) && ratio < 4.f) { t.fitRatio = ratio; src = varispeed(src, ratio); }
+            if (ratio > (t.coverage ? 0.29f : 0.5f) && ratio < 4.f) { t.fitRatio = ratio; src = varispeed(src, ratio); }
             else t.fit = false;
         }
         int start = 0;
@@ -445,16 +449,79 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         if (t.role == Role::Hit || t.role == Role::Roll || t.role == Role::Pattern || t.role == Role::Downlift) envRegion = {tl.downbeat, std::min(tl.length, std::max(t.region.end, tl.downbeat + sr / 2))};
         applyEnvelope(t.env, tb, tl, envRegion);
 
-        // gain automation: build-ups swell into their peak at the junction; hits/tails fall away from it
+        // volume shape: build-ups move into their peak at the junction; hits/tails move away from it.
+        // Depths are big on purpose (the bus compressor would flatten small moves).
         {
             const bool build = t.role == Role::Build || t.role == Role::BuildReverse;
+            if (req.arrangeOnly) {
+                t.vol = build ? Track::Swell : Track::Decay;
+            } else if (build) {
+                t.vol = (Track::VolShape)(Track::Swell + rng.weighted({3.f, 2.f, 2.f, 2.f}));
+                t.autoDepth = t.vol == Track::Swell ? rng.range(24.f, 40.f) : rng.range(14.f, 24.f);
+                t.volStep = req.lengthBeats >= 4.f ? rng.pick<float>({1.f, 0.5f}) : req.lengthBeats >= 1.f ? rng.pick<float>({0.5f, 0.25f}) : 0.125f;
+                if (t.vol == Track::GateRise) t.volStep = std::min(t.volStep, 0.25f);
+                if (rng.chance(0.5f)) t.cutAfter = rng.pick<float>({0.25f, 0.5f, 1.f});
+            } else {
+                const bool low = a.reg == Register::Low;
+                t.vol = low ? (Track::VolShape)(Track::Decay + rng.weighted({3.f, 2.f, 1.f}))
+                            : (Track::VolShape)(Track::Decay + rng.weighted({3.f, 2.f, 2.f, 2.f}));
+                t.autoDepth = rng.range(14.f, 30.f);
+                t.autoCurve = rng.range(0.5f, 1.2f);
+                t.volStep = t.vol == Track::Cut ? rng.pick<float>({0.25f, 0.5f, 1.f}) : rng.pick<float>({0.5f, 0.25f});
+                if (t.vol == Track::GateFall) t.volStep = rng.pick<float>({0.25f, 0.125f});
+            }
             const int a0 = t.region.start, j = build ? junctionBuild : tl.downbeat;
-            const int fallLen = t.role == Role::Downlift ? tl.beat() : sr * 15 / 100;
+            const int fall = req.fallBeats > 0 ? tl.beats(req.fallBeats) : (t.role == Role::Downlift ? tl.beats(2.f) : tl.beat());
+            const int step = std::max(64, tl.beats(t.volStep));
+            const float ramp = (float)(sr / 200); // 5 ms edges, no clicks
+            auto edge = [&](float x, float open) { // 1 inside [0, open), smooth 5 ms edges, 0 after
+                return std::clamp(std::min(x, open - x) / ramp + 0.5f, 0.f, 1.f);
+            };
+            const int cutAt = t.cutAfter > 0 ? tl.downbeat + tl.beats(t.cutAfter) : -1;
             for (int i = 0; i < tl.length; ++i) {
-                float db = 0.f;
-                if (build && i < j && j > a0) db = -t.autoDepth * std::pow(1.f - std::clamp((float)(i - a0) / (float)(j - a0), 0.f, 1.f), t.autoCurve);
-                if (!build && i > j) db = -t.autoDepth * std::pow(std::min(1.f, (float)(i - j) / (float)fallLen), t.autoCurve);
-                const float g = dbToGain(db);
+                float g = 1.f;
+                if (build && i < j && j > a0) {
+                    const float p = std::clamp((float)(i - a0) / (float)(j - a0), 0.f, 1.f); // 0 at the start, 1 at the junction
+                    const int fromJ = j - i;                                                 // grid is counted back from the junction
+                    const float ph = (float)(fromJ % step);
+                    switch (t.vol) {
+                    case Track::Swell: g = p < 0.02f ? p / 0.02f * dbToGain(-t.autoDepth) : dbToGain(-t.autoDepth * std::pow(1.f - p, t.autoCurve)); break;
+                    case Track::Steps: {
+                        const int nSteps = std::max(2, (j - a0) / step + 1), k = nSteps - 1 - fromJ / step; // 0 .. nSteps-1
+                        g = dbToGain(-t.autoDepth * (1.f - (float)std::max(0, k) / (float)(nSteps - 1)));
+                        break;
+                    }
+                    case Track::GateRise: {
+                        const float duty = 0.3f + 0.7f * std::pow(p, 1.5f);
+                        const float x = (float)step - ph; // position inside the step, 0 = step start
+                        g = (fromJ < step ? 1.f : edge(x, duty * (float)step)) * dbToGain(-0.5f * t.autoDepth * (1.f - p));
+                        break;
+                    }
+                    case Track::PumpRise: {
+                        const float x = 1.f - ph / (float)step; // 0 at the grid line, rising through the step
+                        const float dip = std::exp(-x * 5.f) * (1.f - p);                       // duck right after each grid line
+                        g = (1.f - 0.92f * dip) * dbToGain(-0.5f * t.autoDepth * (1.f - p));
+                        break;
+                    }
+                    default: break;
+                    }
+                }
+                if (build && cutAt > 0 && i > cutAt) g *= std::clamp(1.f - (float)(i - cutAt) / ramp, 0.f, 1.f);
+                if (!build && i > j) {
+                    const int d = i - j;
+                    const float q = std::min(1.f, (float)d / (float)fall);
+                    switch (t.vol) {
+                    case Track::Decay: g = dbToGain(-t.autoDepth * std::pow(q, t.autoCurve)); break;
+                    case Track::Cut: g = edge((float)d + ramp, (float)tl.beats(t.volStep)); break;
+                    case Track::PumpFall: {
+                        const float x = (float)(d % step) / (float)step;
+                        g = (d < step ? 1.f : 1.f - 0.9f * std::exp(-x * 6.f)) * dbToGain(-0.6f * t.autoDepth * q);
+                        break;
+                    }
+                    case Track::GateFall: g = (d < step ? 1.f : edge((float)(d % step), 0.5f * (float)step)) * dbToGain(-0.6f * t.autoDepth * q); break;
+                    default: break;
+                    }
+                }
                 tb.L[(size_t)i] *= g; tb.R[(size_t)i] *= g;
             }
         }
@@ -473,8 +540,22 @@ RenderResult renderTransition(const std::vector<Source>& sources, const RenderRe
         trackReport += "，音量 " + fmtf("%.1f", t.gainDb) + " dB";
         if (t.pan != 0) trackReport += "，声像 " + fmtf("%+.2f", t.pan);
         if (t.extraHp > 0) trackReport += "，避让低频高通 150Hz";
-        if (t.role == Role::Build || t.role == Role::BuildReverse) trackReport += "\n  - 自动化：音量从 " + fmtf("-%.0f", t.autoDepth) + " dB 推到衔接点 0 dB（曲线 " + fmtf("%.1f", t.autoCurve) + "）";
-        else trackReport += "\n  - 自动化：衔接点 0 dB，之后 " + std::string(t.role == Role::Downlift ? "1 拍" : "150 ms") + "内降 " + fmtf("%.0f", t.autoDepth) + " dB";
+        {
+            const std::string st = beatsLabel(t.volStep);
+            std::string v;
+            switch (t.vol) {
+            case Track::Swell: v = "渐强：从 -" + fmtf("%.0f", t.autoDepth) + " dB 推到衔接点 0 dB（曲线 " + fmtf("%.1f", t.autoCurve) + "）"; break;
+            case Track::Steps: v = "阶梯推起：每 " + st + " 升一级，从 -" + fmtf("%.0f", t.autoDepth) + " dB 到衔接点 0 dB"; break;
+            case Track::GateRise: v = "门限推起：每 " + st + " 开关一次，开的时间越来越长，最后 " + st + " 全开"; break;
+            case Track::PumpRise: v = "泵感推起：每 " + st + " 压一下，越接近衔接点压得越轻"; break;
+            case Track::Decay: v = "衔接点 0 dB，之后衰减 " + fmtf("%.0f", t.autoDepth) + " dB"; break;
+            case Track::Cut: v = "衔接点 0 dB，" + st + " 后直接断掉"; break;
+            case Track::PumpFall: v = "衔接点 0 dB，之后每 " + st + " 泵一下并往下走"; break;
+            case Track::GateFall: v = "衔接点 0 dB，之后每 " + st + " 切一刀并往下走"; break;
+            }
+            if (t.cutAfter > 0) v += "；强拍后 " + beatsLabel(t.cutAfter) + " 切断余音";
+            trackReport += "\n  - 音量包络：" + v;
+        }
         if (!req.arrangeOnly) trackReport += "\n  - 效果链：";
         for (size_t k = 0; k < t.fx.size(); ++k) {
             trackReport += (k ? " → " : "") + t.fx[k]->describe();
